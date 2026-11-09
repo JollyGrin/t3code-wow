@@ -111,3 +111,15 @@ test('a helper that never starts, or is not installed, is reported', async () =>
   const app = fakeApp(state, MAC_HELPER_VERSION);
   await assert.rejects(new MacHelper({ dir, app, launch: () => false }).request('windows'), /couldn't start/);
 });
+
+test('a helper that quits mid-request is noticed without waiting out the timeout', async () => {
+  const dir = path.join(tmp(), 'capture');
+  fs.mkdirSync(dir);
+  const helper = new MacHelper({ dir, app: '/nonexistent.app' });
+  helper.ensure = async () => {};
+  helper.pid = 2 ** 22 + 12345; // no such process: the helper is gone
+  const t0 = Date.now();
+  await assert.rejects(helper.request('windows', {}, { timeout: 5000 }), /didn't answer/);
+  assert.ok(Date.now() - t0 < 2000);
+  assert.equal(helper.pid, null);
+});

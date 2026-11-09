@@ -399,7 +399,9 @@ export class MacHelper {
     fs.writeFileSync(`${req}.tmp`, JSON.stringify({ op, ...args }), { mode: 0o600 });
     fs.renameSync(`${req}.tmp`, req);
     const until = Date.now() + timeout;
-    while (Date.now() < until) {
+    for (let i = 0; Date.now() < until; i++) {
+      // A helper that quit (or was quit) won't answer: start a new one next time.
+      if (i % 25 === 24 && !isAlive(this.pid)) break;
       let text = null;
       try {
         text = fs.readFileSync(res, 'utf8');
