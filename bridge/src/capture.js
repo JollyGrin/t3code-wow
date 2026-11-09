@@ -132,9 +132,27 @@ async function hyprWindow(pid) {
 export const MAC_HELPER_NAME = 'T3Code WoW Capture';
 export const MAC_HELPER_ID = 'com.t3code-wow.capture';
 const WOW_BUNDLE_ID = 'com.blizzard.worldofwarcraft';
-const OUTSIDE_GAME = 'that area is not inside the World of Warcraft window';
+const OUTSIDE_GAME = "that area isn't the corner of a visible World of Warcraft window";
+// The strip corner may start up to this many points below the window's top.
+const MAC_SEARCH_Y = 40;
+// The largest corner the bridge grabs, in points (at scale 1; Retina needs less).
+const MAC_CORNER = { width: CELLS_PER_ROW * 4 + 32, height: MAX_ROWS * 4 + 32 + MAC_SEARCH_Y };
 
-const MAC_HELPER_JXA = `// ${MAC_HELPER_NAME}: lets the T3 Code bridge for World of Warcraft read the game window.
+// What the helper lets anyone who can write to its folder capture: the strip corner of
+// a visible game window (a screen area, so it stays small) or a whole game window by
+// id (its own pixels, so nothing covering it). Both run inside the helper, which
+// gets their source, and in tests.
+export function allowedCorner(windows, r, max) {
+  if (!Array.isArray(r) || r.length !== 4 || !r.every((n) => typeof n === 'number' && isFinite(n))) return false;
+  if (r[2] <= 0 || r[3] <= 0 || r[2] > max.width || r[3] > max.height) return false;
+  return windows.some((w) => w.layer === 0 && w.onscreen && w.bounds.Width > 100 && w.bounds.Height > 100 && Math.abs(r[0] - w.bounds.X) <= 2 && Math.abs(r[1] - w.bounds.Y) <= 2);
+}
+
+export function allowedWindow(windows, id) {
+  return windows.some((w) => w.id === id && w.layer === 0 && w.onscreen && w.bounds.Width > 100 && w.bounds.Height > 100);
+}
+
+export const MAC_HELPER_JXA = `// ${MAC_HELPER_NAME}: lets the T3 Code bridge for World of Warcraft read the game window.
 // It only lists and captures windows that belong to World of Warcraft (${WOW_BUNDLE_ID}).
 ObjC.import('Foundation');
 ObjC.import('AppKit');
@@ -143,6 +161,9 @@ ObjC.bindFunction('CGPreflightScreenCaptureAccess', ['bool', []]);
 ObjC.bindFunction('CGRequestScreenCaptureAccess', ['bool', []]);
 const fm = $.NSFileManager.defaultManager;
 const IDLE_QUIT_MS = 300000;
+const CORNER = ${JSON.stringify(MAC_CORNER)};
+${allowedCorner.toString()}
+${allowedWindow.toString()}
 let dir = null;
 let last = Date.now();
 
@@ -181,26 +202,16 @@ function gameWindows() {
       isGame[pid] = !app.isNil() && !app.bundleIdentifier.isNil() && app.bundleIdentifier.js === '${WOW_BUNDLE_ID}';
     }
     if (!isGame[pid]) continue;
-    windows.push({ pid: pid, layer: v('kCGWindowLayer'), onscreen: !!v('kCGWindowIsOnscreen'), bounds: ObjC.deepUnwrap(w.objectForKey('kCGWindowBounds')) });
+    windows.push({ id: v('kCGWindowNumber'), pid: pid, layer: v('kCGWindowLayer'), onscreen: !!v('kCGWindowIsOnscreen'), bounds: ObjC.deepUnwrap(w.objectForKey('kCGWindowBounds')) });
   }
   const screens = $.NSScreen.screens.js.map((s) => ({ x: s.frame.origin.x, y: s.frame.origin.y, width: s.frame.size.width, height: s.frame.size.height, scale: s.backingScaleFactor }));
   return { windows: windows, screens: screens };
 }
 
-// Captures a rectangle (in points) only when it lies inside one of the game's windows.
-function capture(req, id) {
-  const r = req.rect;
-  if (!Array.isArray(r) || r.length !== 4 || !r.every((n) => typeof n === 'number' && isFinite(n))) return { ok: false, error: 'bad rect' };
-  const type = req.type === 'jpg' ? 'jpg' : 'bmp';
-  const inside = gameWindows().windows.some((w) => {
-    const b = w.bounds;
-    return w.layer === 0 && b.Width > 100 && b.Height > 100 && r[0] >= b.X - 2 && r[1] >= b.Y - 2 && r[0] + r[2] <= b.X + b.Width + 2 && r[1] + r[3] <= b.Y + b.Height + 2;
-  });
-  if (!inside) return { ok: false, error: '${OUTSIDE_GAME}' };
-  const file = 'cap-' + id + '.' + type;
+function screencapture(args, file) {
   const task = $.NSTask.alloc.init;
   task.launchPath = '/usr/sbin/screencapture';
-  task.arguments = ['-x', '-R', r.map(Math.round).join(','), '-t', type, dir + '/' + file];
+  task.arguments = ['-x'].concat(args, [dir + '/' + file]);
   const err = $.NSPipe.pipe;
   task.standardError = err;
   task.standardOutput = $.NSFileHandle.fileHandleWithNullDevice;
@@ -208,6 +219,18 @@ function capture(req, id) {
   task.waitUntilExit;
   const stderr = $.NSString.alloc.initWithDataEncoding(err.fileHandleForReading.readDataToEndOfFile, $.NSUTF8StringEncoding).js;
   return task.terminationStatus === 0 ? { ok: true, file: file } : { ok: false, error: stderr.trim() || 'screencapture failed' };
+}
+
+// The strip corner (a rectangle in points) of a visible game window, as BMP.
+function captureCorner(req, id) {
+  if (!allowedCorner(gameWindows().windows, req.rect, CORNER)) return { ok: false, error: "${OUTSIDE_GAME}" };
+  return screencapture(['-R', req.rect.map(Math.round).join(','), '-t', 'bmp'], 'cap-' + id + '.bmp');
+}
+
+// A whole visible game window, its own pixels only, as JPEG.
+function captureWindow(req, id) {
+  if (typeof req.id !== 'number' || !allowedWindow(gameWindows().windows, req.id)) return { ok: false, error: 'that is not a visible World of Warcraft window' };
+  return screencapture(['-o', '-l' + req.id, '-t', 'jpg'], 'cap-' + id + '.jpg');
 }
 
 function handle(name) {
@@ -218,7 +241,8 @@ function handle(name) {
   try {
     const req = JSON.parse(text);
     if (req.op === 'windows') res = { ok: true, info: gameWindows() };
-    else if (req.op === 'capture') res = capture(req, id);
+    else if (req.op === 'corner') res = captureCorner(req, id);
+    else if (req.op === 'window') res = captureWindow(req, id);
     else if (req.op === 'request') res = { ok: true, granted: $.CGRequestScreenCaptureAccess() };
     else res = { ok: false, error: 'unknown request' };
   } catch (e) {
@@ -445,7 +469,7 @@ export function pickMacWindow(info, pid) {
   const cx = b.X + b.Width / 2;
   const cy = b.Y + b.Height / 2;
   const screen = screens.find((s) => cx >= s.x && cx < s.x + s.width && cy >= s.y && cy < s.y + s.height) || screens[0];
-  return { found: true, visible: win.onscreen, x: b.X, y: b.Y, width: b.Width, height: b.Height, scale: screen?.scale || 1 };
+  return { found: true, id: win.id, visible: win.onscreen, x: b.X, y: b.Y, width: b.Width, height: b.Height, scale: screen?.scale || 1 };
 }
 
 export const SCREEN_PERMISSION_HELP =
@@ -538,11 +562,11 @@ export class StripCapture {
   }
 
   // The helper runs `screencapture` and writes a file; read it back and remove it.
-  // Rect is in points.
-  async macCapture(rect, type) {
+  // 'corner' takes a rect in points, 'window' a window id.
+  async macCapture(op, args) {
     let res;
     try {
-      res = await this.macRequest('capture', { rect, type });
+      res = await this.macRequest(op, args);
     } catch (err) {
       // The window may have moved or resized since it was looked up: look again next time.
       this.macCache = null;
@@ -572,13 +596,13 @@ export class StripCapture {
         // The strip can start below the window's top: under the title bar of a windowed
         // game, or in fullscreen on a MacBook display, where the game moves its UI below
         // the notch. Search 40 points down rather than guessing either height.
-        searchY = 40;
+        searchY = MAC_SEARCH_Y;
       }
       const w = Math.ceil(px.width / scale);
       const h = Math.ceil(px.height / scale) + searchY;
       let buf;
       try {
-        buf = await this.macCapture([region.x, region.y, w, h], 'bmp');
+        buf = await this.macCapture('corner', { rect: [region.x, region.y, w, h] });
       } catch (err) {
         // The window moved or resized since it was looked up: look again, once.
         if (err.message === OUTSIDE_GAME && !this.manualRegion && !retried) return this.grab(wowPid, true);
@@ -626,10 +650,9 @@ export class StripCapture {
     const name = `wow-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.jpg`;
     if (backend === 'macos') {
       const win = await this.macWindow(wowPid);
-      // screencapture copies a rectangle of the screen, so a hidden game would attach
-      // whatever is showing there instead.
+      // The helper only captures a game window that's on screen (on this Space).
       if (!win.visible) throw new Error("the game window isn't on screen");
-      let data = await this.macCapture([win.x, win.y, win.width, win.height], 'jpg');
+      let data = await this.macCapture('window', { id: win.id });
       // Retina captures come back at twice the size; keep them at the logical size.
       if (win.scale > 1) {
         const file = this.tmpFile(name);

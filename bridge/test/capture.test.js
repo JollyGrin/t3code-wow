@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { pickMacWindow, MacHelper, MAC_HELPER_VERSION, macHelperNeedsBuild, plistHelperVersion, parseHelperResponse } from '../src/capture.js';
+import { pickMacWindow, allowedCorner, allowedWindow, MAC_HELPER_JXA, MacHelper, MAC_HELPER_VERSION, macHelperNeedsBuild, plistHelperVersion, parseHelperResponse } from '../src/capture.js';
 
 const screens = [
   { x: 0, y: 0, width: 1512, height: 982, scale: 2 }, // built-in Retina, the primary
@@ -122,4 +122,21 @@ test('a helper that quits mid-request is noticed without waiting out the timeout
   await assert.rejects(helper.request('windows', {}, { timeout: 5000 }), /didn't answer/);
   assert.ok(Date.now() - t0 < 2000);
   assert.equal(helper.pid, null);
+});
+
+test('the helper captures only the strip corner of a visible game window, or a visible game window by id', () => {
+  const game = { ...win(5, -1776, -260, 1776, 1050), id: 42 };
+  const elsewhere = { ...win(5, 0, 0, 1512, 982, { onscreen: false }), id: 43 }; // on another Space
+  const max = { width: 672, height: 232 };
+  assert.equal(allowedCorner([game], [-1776, -260, 336, 136], max), true);
+  assert.equal(allowedCorner([game], [-1776, -260, 1776, 1050], max), false); // the whole window, including what covers it
+  assert.equal(allowedCorner([game], [0, 0, 336, 136], max), false); // another place on screen
+  assert.equal(allowedCorner([elsewhere], [0, 0, 336, 136], max), false);
+  for (const bad of [null, [1, 2, 3], ['-1776', -260, 1, 1], [-1776, -260, Infinity, 1], [-1776, -260, -5, 10]]) assert.equal(allowedCorner([game], bad, max), false);
+  assert.equal(allowedWindow([game, elsewhere], 42), true);
+  assert.equal(allowedWindow([game, elsewhere], 43), false);
+  assert.equal(allowedWindow([game], 7), false);
+  assert.equal(pickMacWindow({ windows: [game], screens }, 5).id, 42);
+  // The helper runs these same rules.
+  assert.ok(MAC_HELPER_JXA.includes(allowedCorner.toString()) && MAC_HELPER_JXA.includes(allowedWindow.toString()));
 });
