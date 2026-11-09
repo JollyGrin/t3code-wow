@@ -51,7 +51,8 @@ It downloads the latest version, replaces the installed copy and restarts the br
 
 The same install command works on a Mac with the native WoW: Forever client. Install Node.js 22 first (`brew install node`). The installer finds the game in `/Applications/World of Warcraft` or wherever Battle.net put it, and runs the bridge as a launch agent (`~/Library/LaunchAgents/t3code-wow.plist`) instead of a systemd service.
 
-- **Screen Recording permission.** The bridge reads the strip with macOS's `screencapture`, so it needs Screen Recording. The first time it runs, macOS asks, or lists `node` switched off under System Settings > Privacy & Security > Screen & System Audio Recording. Turn it on, then restart the bridge with `launchctl kickstart -k gui/$(id -u)/t3code-wow`. If the link stays down, `t3code-wow status` names the exact `node` it needs. The permission belongs to that `node` binary, so other programs that run with it can record the screen too. After you upgrade Node, macOS asks again for the new one.
+- **Screen Recording permission.** The bridge reads the strip with macOS's `screencapture`, which needs Screen Recording. Node never gets that permission: the installer builds a small helper app, `~/Applications/T3Code WoW Capture.app`, which lists and captures only World of Warcraft's windows, and the bridge asks it for each capture. The first time, macOS asks to let **T3Code WoW Capture** record the screen: click Open System Settings and turn it on under Privacy & Security > Screen & System Audio Recording. The bridge picks it up within a few seconds. Upgrading Node doesn't ask again, and neither does an update, unless the helper itself changed (the installer says so). Its script is in `bridge/src/capture.js`.
+- **Upgrading from 0.2.0.** That version needed Screen Recording for `node`, which lets every Node program on your Mac record the screen. Turn `node` off under Screen & System Audio Recording. macOS 26 may not list `node` even while it's allowed; then `tccutil reset ScreenCapture` clears every app's Screen Recording permission, and you turn back on the ones you use.
 - **Display settings.** Run the game at the display's full resolution (its Retina resolution on a Retina display), fullscreen or windowed. A resolution the display stretches blurs the strip.
 - **Speech** uses the system voice (`say`). **Dictation** isn't available on macOS yet, and the Usage tab shows what T3 Code reports.
 - `~/.local/bin` isn't on a Mac's PATH by default. The installer says so; add it to your shell profile, or run `~/.local/bin/t3code-wow`.
@@ -62,7 +63,7 @@ The same install command works on a Mac with the native WoW: Forever client. Ins
 t3code-wow uninstall
 ```
 
-This removes the addon and its update folders, its settings in the game, the bridge service (or launch agent), the bridge's T3 Code sessions (here and on any machine you added) and its files. On macOS, also turn `node` off under Screen & System Audio Recording: uninstalling can't do that for you.
+This removes the addon and its update folders, its settings in the game, the bridge service (or launch agent), the bridge's T3 Code sessions (here and on any machine you added) and its files. On macOS it also removes T3Code WoW Capture and its Screen Recording permission. If you allowed `node` for version 0.2.0, turn that off yourself (see [macOS](#macos)).
 
 ## Using it
 
