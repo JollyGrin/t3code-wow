@@ -132,6 +132,7 @@ async function hyprWindow(pid) {
 export const MAC_HELPER_NAME = 'T3Code WoW Capture';
 export const MAC_HELPER_ID = 'com.t3code-wow.capture';
 const WOW_BUNDLE_ID = 'com.blizzard.worldofwarcraft';
+const OUTSIDE_GAME = 'that area is not inside the World of Warcraft window';
 
 const MAC_HELPER_JXA = `// ${MAC_HELPER_NAME}: lets the T3 Code bridge for World of Warcraft read the game window.
 // It only lists and captures windows that belong to World of Warcraft (${WOW_BUNDLE_ID}).
@@ -195,7 +196,7 @@ function capture(req, id) {
     const b = w.bounds;
     return w.layer === 0 && b.Width > 100 && b.Height > 100 && r[0] >= b.X - 2 && r[1] >= b.Y - 2 && r[0] + r[2] <= b.X + b.Width + 2 && r[1] + r[3] <= b.Y + b.Height + 2;
   });
-  if (!inside) return { ok: false, error: 'that area is not inside the World of Warcraft window' };
+  if (!inside) return { ok: false, error: '${OUTSIDE_GAME}' };
   const file = 'cap-' + id + '.' + type;
   const task = $.NSTask.alloc.init;
   task.launchPath = '/usr/sbin/screencapture';
@@ -548,7 +549,7 @@ export class StripCapture {
     return this.helper().take(res.file);
   }
 
-  async grab(wowPid) {
+  async grab(wowPid, retried = false) {
     const backend = this.resolveBackend();
     this.stats.captures++;
     if (backend === 'none') throw new Error('no capture backend: install grim (Wayland/wlroots) or ImageMagick (X11)');
@@ -573,7 +574,14 @@ export class StripCapture {
       }
       const w = Math.ceil(px.width / scale);
       const h = Math.ceil(px.height / scale) + searchY;
-      const buf = await this.macCapture([region.x, region.y, w, h], 'bmp');
+      let buf;
+      try {
+        buf = await this.macCapture([region.x, region.y, w, h], 'bmp');
+      } catch (err) {
+        // The window moved or resized since it was looked up: look again, once.
+        if (err.message === OUTSIDE_GAME && !this.manualRegion && !retried) return this.grab(wowPid, true);
+        throw err;
+      }
       const image = parseBMP(buf);
       // screencapture works in physical pixels: scale the slack to match the image.
       return { status: 'ok', image, searchY: Math.ceil(searchY * (image.width / w)) };
