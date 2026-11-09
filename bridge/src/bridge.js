@@ -208,7 +208,7 @@ export class Bridge {
     this.bank = new SlotBank(addonsDir, { slots: config.slots || 1200 });
     const installed = this.bank.installedSlotCount();
     if (installed > 0) this.bank.slots = installed;
-    this.capture = new StripCapture({ log: this.log, backend: config.capture?.backend || 'auto', region: config.capture?.region || null });
+    this.capture = new StripCapture({ log: this.log, backend: config.capture?.backend || 'auto', region: config.capture?.region || null, stateDir });
     this.tokens = tokenProvider({ log: this.log });
     // Every T3 Code machine we show: this one, plus any added with `t3code-wow env add`.
     this.t3 = new Fleet({ localTokens: this.tokens, environments: config.environments || [], log: this.log });

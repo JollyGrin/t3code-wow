@@ -10,7 +10,7 @@ import { Bridge, STATE_DIR, VERSION } from '../src/bridge.js';
 import { CONFIG_DIR, mintToken, readToken, tokenClaims, findT3Cli } from '../src/auth.js';
 import { findWowInstalls, addonsDir as addonsDirOf, findWowProcess } from '../src/wow.js';
 import { SlotBank, ADDON, CTL_LONG } from '../src/slots.js';
-import { StripCapture, SCREEN_PERMISSION_HELP } from '../src/capture.js';
+import { StripCapture, SCREEN_PERMISSION_HELP, MAC_HELPER_NAME, installMacHelper, removeMacHelper, macHelperPath } from '../src/capture.js';
 import { decodeImage } from '../src/codec.js';
 import { identify, discoverTailscale, mintRemote, revokeRemote, saveToken, readTokenData, tokenFile } from '../src/envs.js';
 
@@ -247,6 +247,21 @@ async function cmdInstall(args) {
   }
   console.log(`${C.g('✓')} T3 Code session ready ${C.d('(scoped to reading and running threads; revoke with `t3 auth session list`)')}`);
 
+  let helper = null;
+  if (MAC) {
+    // Built only when its script changed: a rebuild makes macOS ask again.
+    try {
+      helper = installMacHelper();
+    } catch (err) {
+      console.log(C.r(`✗ Couldn't build ${MAC_HELPER_NAME}: ${err.message}`));
+      process.exitCode = 1;
+      return;
+    }
+    if (helper === 'built') console.log(`${C.g('✓')} ${MAC_HELPER_NAME} installed ${C.d(`(${macHelperPath()}; it holds the Screen Recording permission, so node doesn't need it)`)}`);
+    else if (helper === 'rebuilt') console.log(`${C.g('✓')} ${MAC_HELPER_NAME} updated ${C.d('(it changed, so macOS asks for Screen Recording permission again)')}`);
+    else console.log(`${C.g('✓')} ${MAC_HELPER_NAME} is up to date ${C.d('(its Screen Recording permission is kept)')}`);
+  }
+
   if (!args['no-service']) {
     if (!service.install()) {
       console.log(C.r(`✗ The bridge's ${service.kind} didn't start (the error is above). Fix that, then run \`t3code-wow install\` again.`));
@@ -254,7 +269,8 @@ async function cmdInstall(args) {
       return;
     }
     console.log(`${C.g('✓')} Bridge running as the ${service.name} ${service.kind}`);
-    if (MAC) console.log(`${C.y('!')} The bridge reads the game's pixels, so macOS asks for Screen Recording permission the first time.`);
+    if (helper && helper !== 'current') console.log(`${C.y('!')} The bridge reads the game's pixels, so macOS asks to let ${C.b(MAC_HELPER_NAME)} record the screen: turn it on in System Settings.`);
+    if (helper === 'built') console.log(`${C.y('!')} If you turned on \`node\` under Screen & System Audio Recording for an earlier version, turn it off: the bridge doesn't need it any more.`);
   }
 
   console.log('');
@@ -393,7 +409,7 @@ function cmdStatus(args) {
 
 async function cmdProbe() {
   const proc = findWowProcess();
-  const cap = new StripCapture({});
+  const cap = new StripCapture({ stateDir: STATE_DIR });
   console.log(`backend: ${cap.resolveBackend()}; WoW pid: ${proc?.pid ?? 'not running'}`);
   const res = await cap.grab(proc?.pid);
   if (res.status !== 'ok') return console.log(`capture: ${res.status}`);
@@ -438,6 +454,7 @@ async function cmdUninstall(args) {
     service.remove();
     done('Stopped and removed the bridge service');
   }
+  if (MAC && removeMacHelper()) done(`Removed ${MAC_HELPER_NAME} and its Screen Recording permission`);
 
   let wowDir = cfg.wowDir;
   if (!wowDir) {
