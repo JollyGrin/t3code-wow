@@ -266,7 +266,7 @@ _G.C_GamePad = {
 Stub.slotCount = 600
 Stub.loadedSlots = {}
 _G.C_AddOns = {
-	GetAddOnMetadata = function(_, key) return key == "Version" and "0.2.0" or nil end,
+	GetAddOnMetadata = function(_, key) return key == "Version" and "0.3.0" or nil end,
 	DoesAddOnExist = function(name)
 		local n = tonumber(name:match("T3Code_S(%d+)"))
 		return n ~= nil and n <= Stub.slotCount

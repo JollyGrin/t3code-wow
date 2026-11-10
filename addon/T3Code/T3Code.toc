@@ -2,7 +2,7 @@
 ## Title: T3 Code
 ## Notes: Watch and run your T3 Code agent threads from inside the game. Needs the t3code-wow bridge running on this computer.
 ## Author: Ryan Hughes
-## Version: 0.2.0
+## Version: 0.3.0
 ## X-License: MIT
 ## X-Website: https://github.com/ryanrhughes/t3code-wow
 ## IconTexture: Interface\AddOns\T3Code\Media\icon

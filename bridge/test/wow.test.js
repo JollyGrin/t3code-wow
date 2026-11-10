@@ -8,7 +8,7 @@ import path from 'node:path';
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 't3wow-home-'));
 process.env.HOME = home;
 delete process.env.WINEPREFIX;
-const { findWowInstalls: findAny, parseMacProcesses } = await import('../src/wow.js');
+const { findWowInstalls: findAny, parseMacProcesses, isForeverClient } = await import('../src/wow.js');
 const findWowInstalls = () => findAny({ platform: 'linux' });
 
 function touch(p, content = '') {
@@ -19,6 +19,7 @@ function touch(p, content = '') {
 function reset() {
   fs.rmSync(path.join(home, 'Games'), { recursive: true, force: true });
   fs.rmSync(path.join(home, '.local'), { recursive: true, force: true });
+  fs.rmSync(path.join(home, 'Faugus'), { recursive: true, force: true });
 }
 
 const omarchy = () => path.join(home, 'Games/battlenet');
@@ -28,6 +29,19 @@ test("finds Forever in Omarchy's Battle.net prefix", () => {
   touch(path.join(omarchy(), 'drive_c/Program Files (x86)/Battle.net/Battle.net.exe'));
   touch(path.join(omarchy(), 'drive_c/Program Files (x86)/World of Warcraft/_forever_/Wow.exe'));
   assert.deepEqual(findWowInstalls().forever, [path.join(omarchy(), 'drive_c/Program Files (x86)/World of Warcraft/_forever_')]);
+});
+
+test('finds the ARM client before its first launch', () => {
+  reset();
+  touch(path.join(omarchy(), 'drive_c/Program Files (x86)/World of Warcraft/_forever_/Wow-ARM64.exe'));
+  assert.deepEqual(findWowInstalls().forever, [path.join(omarchy(), 'drive_c/Program Files (x86)/World of Warcraft/_forever_')]);
+});
+
+test('recognizes the running Forever client on x86 and ARM, not Retail', () => {
+  assert.ok(isForeverClient('C:\\Program Files (x86)\\World of Warcraft\\_forever_\\Wow.exe\0-launcherlogin\0'));
+  assert.ok(isForeverClient('C:\\Program Files (x86)\\World of Warcraft\\_forever_\\Wow-arm64.exe\0-launcherlogin\0-uid\0wowf\0'));
+  assert.ok(!isForeverClient('C:\\Program Files (x86)\\World of Warcraft\\_retail_\\Wow-arm64.exe\0'));
+  assert.ok(!isForeverClient('C:\\Program Files (x86)\\World of Warcraft\\_forever_\\Utils\\WowVoiceProxy.exe\0'));
 });
 
 test("finds a custom install folder from Battle.net's records, including another drive", () => {
@@ -59,6 +73,33 @@ test('tells WoW without Forever apart from no WoW at all, and ignores other game
   r = findWowInstalls();
   assert.deepEqual([r.forever.length, r.wowOnly.length], [0, 0]);
   assert.deepEqual(r.prefixes, [omarchy()], 'only prefixes that really hold Battle.net');
+});
+
+test("finds prefixes Faugus Launcher and Lutris recorded, and counts a prefix's pfx link once", () => {
+  reset();
+  // A prefix Faugus recorded anywhere, here ~/Games itself.
+  const games = path.join(home, 'Games');
+  touch(path.join(games, 'drive_c/Program Files (x86)/World of Warcraft/_forever_/Wow.exe'));
+  touch(path.join(home, '.local/share/faugus-launcher/games.json'), JSON.stringify([{ gameid: 'battlenet', prefix: games }]));
+  let r = findWowInstalls();
+  assert.deepEqual(r.forever, [path.join(games, 'drive_c/Program Files (x86)/World of Warcraft/_forever_')]);
+
+  // Faugus's default folder, where umu links each prefix's pfx back to itself.
+  reset();
+  const faugus = path.join(home, 'Faugus/battlenet');
+  touch(path.join(faugus, 'drive_c/Program Files (x86)/World of Warcraft/_forever_/Wow.exe'));
+  touch(path.join(faugus, 'drive_c/Program Files (x86)/Battle.net/Battle.net.exe'));
+  fs.symlinkSync('.', path.join(faugus, 'pfx'));
+  r = findWowInstalls();
+  assert.deepEqual(r.forever, [path.join(faugus, 'drive_c/Program Files (x86)/World of Warcraft/_forever_')]);
+  assert.deepEqual(r.prefixes, [faugus]);
+
+  reset();
+  const lutris = path.join(home, 'Games/bnet-lutris');
+  touch(path.join(lutris, 'drive_c/Program Files (x86)/World of Warcraft/_forever_/Wow.exe'));
+  touch(path.join(home, '.local/share/lutris/games/battlenet-1.yml'), 'game:\n  exe: drive_c/Battle.net.exe\n  prefix: ~/Games/bnet-lutris\nwine:\n  version: ge\n');
+  r = findWowInstalls();
+  assert.deepEqual(r.forever, [path.join(lutris, 'drive_c/Program Files (x86)/World of Warcraft/_forever_')]);
 });
 
 test("finds Forever on macOS from Battle.net's records and /Applications", () => {

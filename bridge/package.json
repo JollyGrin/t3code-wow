@@ -1,6 +1,6 @@
 {
   "name": "t3code-wow",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Bridge between the T3 Code addon for World of Warcraft: Forever and a running T3 Code server. Early release, experimental.",
   "homepage": "https://github.com/ryanrhughes/t3code-wow",
   "repository": {
@@ -21,7 +21,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test test/*.test.js",
     "start": "node bin/t3code-wow.js run"
   },
   "license": "MIT"

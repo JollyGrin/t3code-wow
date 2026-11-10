@@ -7,6 +7,8 @@
 // channels are each fully on or off (bit 2 = R, bit 1 = G, bit 0 = B), laid out
 // row-major, CELLS_PER_ROW cells per row, starting at the top-left of the game's UI.
 
+import zlib from 'node:zlib';
+
 export const MAGIC = [0x54, 0x33];
 export const VERSION = 1; // plaintext (only ever a hello: the bridge ignores commands in it)
 export const VERSIONS = new Set([1, 2]); // 2: encrypted, see strip-crypto.js
@@ -96,14 +98,17 @@ function cellValueAt(img, x, y) {
 }
 
 function readCells(img, geo, start, n) {
-  const { ox, oy, cell } = geo;
-  const half = Math.floor(cell / 2);
+  const { ox, oy } = geo;
+  // `pitch` is the measured cell spacing when it isn't a whole number of pixels. The
+  // game's reported screen height can be a little off from what it draws (1792 vs 1800
+  // on a 2x laptop), so the addon's 3px squares land about 3.01px apart.
+  const p = geo.pitch ?? geo.cell;
   const cells = new Array(n);
   for (let k = 0; k < n; k++) {
     const idx = start + k;
     const col = idx % CELLS_PER_ROW;
     const row = Math.floor(idx / CELLS_PER_ROW);
-    const v = cellValueAt(img, ox + col * cell + half, oy + row * cell + half);
+    const v = cellValueAt(img, ox + Math.floor(col * p + p / 2), oy + Math.floor(row * p + p / 2));
     if (v < 0) return null;
     cells[k] = v;
   }
@@ -144,12 +149,32 @@ export function decodeImage(img, hint, opts) {
   const head = headerAt(img, geo);
   if (head.len > MAX_PAYLOAD) return { error: 'bad length', geo };
   const total = HEADER_BYTES + head.len + 2;
+  let out = readFrame(img, geo, head, total);
+  if (out.error === 'checksum mismatch') out = refinePitch(img, geo, head, total) || out;
+  return out;
+}
+
+function readFrame(img, geo, head, total) {
   const cells = readCells(img, geo, 0, cellsForBytes(total));
   if (!cells) return { error: 'strip clipped by capture region', geo };
   const bytes = cellsToBytes(cells, total);
   const [s1, s2] = fletcher16(bytes, 2, HEADER_BYTES + head.len);
   if (bytes[total - 2] !== s1 || bytes[total - 1] !== s2) return { error: 'checksum mismatch', geo };
   return { version: head.version, seq: head.seq, payload: Buffer.from(bytes.slice(HEADER_BYTES, HEADER_BYTES + head.len)), geo };
+}
+
+// The squares drift when the cell spacing isn't a whole number of pixels. Try spacings
+// within 2% of the whole-pixel size and keep the middle of the range that reads
+// cleanly, so the next frame (and longer ones) have the most margin either side.
+function refinePitch(img, geo, head, total) {
+  const ok = [];
+  for (let p = geo.cell * 0.98; p <= geo.cell * 1.02; p += geo.cell / 1000) {
+    const g = { ox: geo.ox, oy: geo.oy, cell: geo.cell, pitch: p };
+    if (!headerAt(img, g)) continue;
+    const out = readFrame(img, g, head, total);
+    if (!out.error) ok.push(out);
+  }
+  return ok.length ? ok[Math.floor(ok.length / 2)] : null;
 }
 
 // Render cells into an RGB image (for tests and the probe tool).
@@ -238,4 +263,73 @@ export function parseBMP(buf) {
     }
   }
   return { width, height, data };
+}
+
+// Parse the raw pixels KWin's ScreenShot2 interface writes, described by its reply
+// (width, height, stride, and the QImage::Format number) into the same RGB image.
+// 8-bit formats are what KWin sends for SDR outputs; the 16-bit ones can come from HDR.
+const QIMAGE_LAYOUTS = {
+  4: { bytes: 4, rgb: [2, 1, 0] }, // RGB32: 0xffRRGGBB words, little-endian
+  5: { bytes: 4, rgb: [2, 1, 0] }, // ARGB32
+  6: { bytes: 4, rgb: [2, 1, 0] }, // ARGB32_Premultiplied
+  16: { bytes: 4, rgb: [0, 1, 2] }, // RGBX8888: bytes in R, G, B, X order
+  17: { bytes: 4, rgb: [0, 1, 2] }, // RGBA8888
+  18: { bytes: 4, rgb: [0, 1, 2] }, // RGBA8888_Premultiplied
+  25: { bytes: 8, rgb: [1, 3, 5] }, // RGBX64: 16-bit little-endian channels, take the high byte
+  26: { bytes: 8, rgb: [1, 3, 5] }, // RGBA64
+  27: { bytes: 8, rgb: [1, 3, 5] }, // RGBA64_Premultiplied
+};
+
+export function parseQImage(buf, { width, height, stride, format }) {
+  const layout = QIMAGE_LAYOUTS[format];
+  if (!layout) throw new Error(`unsupported KWin image format ${format}`);
+  if (buf.length < stride * (height - 1) + width * layout.bytes) throw new Error('short KWin image');
+  const [r, g, b] = layout.rgb;
+  const data = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * stride + x * layout.bytes;
+      const o = (y * width + x) * 3;
+      data[o] = buf[i + r];
+      data[o + 1] = buf[i + g];
+      data[o + 2] = buf[i + b];
+    }
+  }
+  return { width, height, data };
+}
+
+const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (const byte of buf) c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+// Encode an RGB image as a PNG, for screenshots when ImageMagick isn't there to make a JPEG.
+export function encodePNG({ width, height, data }) {
+  const chunk = (type, body) => {
+    const head = Buffer.alloc(8);
+    head.writeUInt32BE(body.length, 0);
+    head.write(type, 4, 'latin1');
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(Buffer.concat([head.subarray(4), body])));
+    return Buffer.concat([head, body, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr.set([8, 2, 0, 0, 0], 8); // 8-bit RGB, no interlace
+  const rows = Buffer.alloc((width * 3 + 1) * height);
+  for (let y = 0; y < height; y++) data.copy(rows, y * (width * 3 + 1) + 1, y * width * 3, (y + 1) * width * 3);
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(rows)),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
 }

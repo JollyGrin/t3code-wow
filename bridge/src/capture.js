@@ -2,16 +2,17 @@
 // game window and decode the addon's pixel strip.
 //
 // Hyprland (and other wlroots compositors) allow screencopy, so `grim` can read the
-// game's pixels on Wayland. X11 sessions use ImageMagick's `import`. macOS uses its
+// game's pixels on Wayland. KDE Plasma's KWin doesn't, but its ScreenShot2 D-Bus
+// interface does the same job. X11 sessions use ImageMagick's `import`. macOS uses its
 // own `screencapture` through a helper app that holds the Screen Recording permission.
 
-import { execFile, spawnSync } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { decodeImage, parsePPM, parseBMP, CELLS_PER_ROW, MAX_ROWS } from './codec.js';
+import { decodeImage, parsePPM, parseBMP, parseQImage, encodePNG, CELLS_PER_ROW, MAX_ROWS } from './codec.js';
 
 // A service may start before the session exports WAYLAND_DISPLAY; find the socket.
 function captureEnv() {
@@ -24,14 +25,15 @@ function captureEnv() {
   return process.env;
 }
 
-function run(cmd, args, { maxBuffer = 32 * 1024 * 1024, timeout = 4000 } = {}) {
+function run(cmd, args, { maxBuffer = 32 * 1024 * 1024, timeout = 4000, input = null } = {}) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { encoding: 'buffer', maxBuffer, timeout, env: captureEnv() }, (err, stdout, stderr) => {
+    const child = execFile(cmd, args, { encoding: 'buffer', maxBuffer, timeout, env: captureEnv() }, (err, stdout, stderr) => {
       if (err) {
         err.stderr = stderr?.toString();
         reject(err);
       } else resolve(stdout);
     });
+    if (input) child.stdin.end(input);
   });
 }
 
@@ -472,6 +474,97 @@ export function pickMacWindow(info, pid) {
   return { found: true, id: win.id, visible: win.onscreen, x: b.X, y: b.Y, width: b.Width, height: b.Height, scale: screen?.scale || 1 };
 }
 
+// ---------------------------------------------------------------------------
+// KDE Plasma: KWin doesn't offer wlroots' screencopy, so grim can't read it. Its D-Bus
+// API can: the windows runner (KRunner's window search) finds windows by caption,
+// getWindowInfo gives their geometry, pid, desktops and minimized state, and
+// ScreenShot2 writes raw pixels into a pipe we pass it. busctl ships with systemd and
+// can pass that pipe, so there's nothing to install.
+
+const KWIN_WINDOW_ID = /\{[0-9a-f-]{36}\}$/i;
+
+// Runs busctl and parses its JSON reply. With `pipe`, busctl gets a pipe as fd 3 for an
+// `h` argument, and the result also carries what was written to it.
+function busctl(args, { pipe = false, timeout = 4000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('busctl', ['--user', '--json=short', 'call', ...args], {
+      stdio: ['ignore', 'pipe', 'pipe', ...(pipe ? ['pipe'] : [])],
+      env: captureEnv(),
+    });
+    const out = [];
+    const err = [];
+    const data = [];
+    let pending = pipe ? 2 : 1;
+    let code = null;
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`busctl ${args[3]} timed out`));
+    }, timeout);
+    const done = () => {
+      if (--pending) return;
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(Buffer.concat(err).toString('utf8').trim() || `busctl ${args[3]} failed`));
+      try {
+        resolve({ reply: JSON.parse(Buffer.concat(out).toString('utf8')).data, data: Buffer.concat(data) });
+      } catch (e) {
+        reject(e);
+      }
+    };
+    child.stdout.on('data', (d) => out.push(d));
+    child.stderr.on('data', (d) => err.push(d));
+    if (pipe) {
+      child.stdio[3].on('data', (d) => data.push(d));
+      child.stdio[3].on('close', done);
+    }
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on('close', (c) => {
+      code = c;
+      done();
+    });
+  });
+}
+
+// a{sv} as busctl prints it ({ key: { type, data } }) -> { key: data }.
+const plainDict = (dict) => Object.fromEntries(Object.entries(dict).map(([k, v]) => [k, v.data]));
+
+// The game window from getWindowInfo replies: found by pid, else by caption. It's
+// visible unless minimized or on another virtual desktop (no desktops means all).
+export function pickKwinWindow(infos, pid, desktop) {
+  const win =
+    infos.find((w) => pid && w.pid === pid) ||
+    infos.find((w) => w.caption === 'World of Warcraft') ||
+    infos.find((w) => /^World of Warcraft/.test(w.caption || ''));
+  if (!win) return { found: false };
+  const visible = !win.minimized && (!win.desktops?.length || win.desktops.includes(desktop));
+  return { found: true, visible, uuid: win.uuid, x: win.x, y: win.y, width: win.width, height: win.height };
+}
+
+async function kwinWindow(pid) {
+  const [{ reply: matches }, { reply: current }] = await Promise.all([
+    busctl(['org.kde.KWin', '/WindowsRunner', 'org.kde.krunner1', 'Match', 's', 'World of Warcraft']),
+    busctl(['org.kde.KWin', '/VirtualDesktopManager', 'org.freedesktop.DBus.Properties', 'Get', 'ss', 'org.kde.KWin.VirtualDesktopManager', 'current']),
+  ]);
+  // Match ids are "<action>_{uuid}"; a window can appear once per action.
+  const ids = [...new Set(matches[0].map((m) => KWIN_WINDOW_ID.exec(m[0])?.[0]).filter(Boolean))];
+  const infos = await Promise.all(ids.map((id) => busctl(['org.kde.KWin', '/KWin', 'org.kde.KWin', 'getWindowInfo', 's', id]).then((r) => plainDict(r.reply[0]))));
+  return pickKwinWindow(infos, pid, current[0].data);
+}
+
+// One ScreenShot2 call; `args` are the method's arguments before the options and pipe.
+async function kwinCapture(method, signature, args, options, timeout = 4000) {
+  const opts = Object.entries(options).flatMap(([k, v]) => [k, 'b', String(v)]);
+  const { reply, data } = await busctl(
+    ['org.kde.KWin', '/org/kde/KWin/ScreenShot2', 'org.kde.KWin.ScreenShot2', method, `${signature}a{sv}h`, ...args.map(String), String(opts.length / 3), ...opts, '3'],
+    { pipe: true, timeout },
+  );
+  const meta = plainDict(reply[0]);
+  if (meta.type !== 'raw') throw new Error(`unexpected KWin image type ${meta.type}`);
+  return parseQImage(data, meta);
+}
+
 export const SCREEN_PERMISSION_HELP =
   `macOS hasn't let ${MAC_HELPER_NAME} record the screen. Open System Settings > Privacy & Security > Screen & System Audio Recording and turn on ${MAC_HELPER_NAME} (if it isn't listed, add it with + from ${macHelperPath()}). The bridge notices within a few seconds.`;
 
@@ -489,7 +582,7 @@ export class StripCapture {
     this.lastSeenAt = 0;
     this.stats = { captures: 0, decoded: 0, rejected: 0, notVisible: 0 };
     this.lastImage = null;
-    this.macCache = null; // { pid, at, win }: the window list costs a helper round trip
+    this.winCache = null; // { pid, at, win }: window lookups cost a helper round trip or several D-Bus calls
     this.macAsked = false;
     this.macHelper = stateDir ? new MacHelper({ dir: path.join(stateDir, 'capture') }) : null;
     this.tmpDir = null;
@@ -498,6 +591,7 @@ export class StripCapture {
   resolveBackend() {
     if (this.backend !== 'auto') return this.backend;
     if (process.platform === 'darwin') return 'macos';
+    if (/(^|:)KDE(:|$)/.test(process.env.XDG_CURRENT_DESKTOP || '') && which('busctl')) return 'kwin';
     if (process.env.WAYLAND_DISPLAY || hyprSocket()) {
       if (hyprSocket() && which('grim')) return 'hyprland';
       if (which('grim')) return 'grim';
@@ -513,13 +607,21 @@ export class StripCapture {
     return { width: CELLS_PER_ROW * cell + 32, height: MAX_ROWS * cell + 32 };
   }
 
-  async macWindow(pid) {
-    const c = this.macCache;
+  // The game window, looked up at most every 2 seconds.
+  async cachedWindow(pid, lookup) {
+    const c = this.winCache;
     if (c && c.pid === pid && Date.now() - c.at < 2000) return c.win;
-    const res = await this.macRequest('windows', { pid });
-    const win = pickMacWindow(res.info, pid);
-    this.macCache = { pid, at: Date.now(), win };
+    const win = await lookup(pid);
+    this.winCache = { pid, at: Date.now(), win };
     return win;
+  }
+
+  macWindow(pid) {
+    return this.cachedWindow(pid, async () => pickMacWindow((await this.macRequest('windows', { pid })).info, pid));
+  }
+
+  kwinWindow(pid) {
+    return this.cachedWindow(pid, kwinWindow);
   }
 
   helper() {
@@ -569,7 +671,7 @@ export class StripCapture {
       res = await this.macRequest(op, args);
     } catch (err) {
       // The window may have moved or resized since it was looked up: look again next time.
-      this.macCache = null;
+      this.winCache = null;
       throw err;
     }
     return this.helper().take(res.file);
@@ -578,7 +680,7 @@ export class StripCapture {
   async grab(wowPid, retried = false) {
     const backend = this.resolveBackend();
     this.stats.captures++;
-    if (backend === 'none') throw new Error('no capture backend: install grim (Wayland/wlroots) or ImageMagick (X11)');
+    if (backend === 'none') throw new Error('no capture backend: install grim (Wayland/wlroots) or ImageMagick (X11); on KDE Plasma the bridge uses busctl from systemd');
     const px = StripCapture.stripPixels(4);
     if (backend === 'macos') {
       let region = this.manualRegion;
@@ -610,6 +712,27 @@ export class StripCapture {
       }
       const image = parseBMP(buf);
       // screencapture works in physical pixels: scale the slack to match the image.
+      return { status: 'ok', image, searchY: Math.ceil(searchY * (image.width / w)) };
+    }
+    if (backend === 'kwin') {
+      let region = this.manualRegion;
+      let searchY = 0;
+      if (!region) {
+        const win = await this.kwinWindow(wowPid);
+        if (!win.found) return { status: 'no-window' };
+        if (!win.visible) {
+          this.stats.notVisible++;
+          return { status: 'hidden' };
+        }
+        region = { x: win.x, y: win.y };
+        // KWin reports the frame, so a windowed game's UI starts below the title bar.
+        searchY = 40;
+      }
+      // The region is in logical pixels; at a scale above 1 this grabs more than the
+      // strip needs, which is harmless. Native resolution keeps the cells unresampled.
+      const w = px.width;
+      const h = px.height + searchY;
+      const image = await kwinCapture('CaptureArea', 'iiuu', [Math.round(region.x), Math.round(region.y), w, h], { 'native-resolution': true });
       return { status: 'ok', image, searchY: Math.ceil(searchY * (image.width / w)) };
     }
     if (backend === 'hyprland' || backend === 'grim') {
@@ -648,6 +771,17 @@ export class StripCapture {
   async screenshot(wowPid) {
     const backend = this.resolveBackend();
     const name = `wow-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.jpg`;
+    if (backend === 'kwin') {
+      // KWin renders the window itself, so this works even while it's covered.
+      const win = await this.kwinWindow(wowPid);
+      if (!win.found) throw new Error("couldn't find the game window");
+      const image = await kwinCapture('CaptureWindow', 's', [win.uuid], { 'include-decoration': false, 'include-shadow': false }, 8000);
+      if (which('magick')) {
+        const data = await run('magick', ['-size', `${image.width}x${image.height}`, '-depth', '8', 'rgb:-', '-quality', '85', 'jpeg:-'], { timeout: 8000, input: image.data });
+        return { data, name, mime: 'image/jpeg' };
+      }
+      return { data: encodePNG(image), name: name.replace(/\.jpg$/, '.png'), mime: 'image/png' };
+    }
     if (backend === 'macos') {
       const win = await this.macWindow(wowPid);
       // The helper only captures a game window that's on screen (on this Space).

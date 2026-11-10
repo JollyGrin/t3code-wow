@@ -80,6 +80,11 @@ ns.Main.composer._text = "Please run the tests"
 ns.Main:Send()
 check(#ns.Transport.queue >= 1, "command queued")
 check(ns.Transport:Payload():find("Please run the tests", 1, true) ~= nil, "message in strip payload")
+check(ns.Transport.queue[#ns.Transport.queue].args[3] == "steer", "follow-ups ask to steer by default")
+ns.db.settings.steerFollowUps = false
+ns.Main:Send("And the linter")
+check(ns.Transport.queue[#ns.Transport.queue].args[3] == nil, "with steering off, a follow-up names no mode, so the bridge queues it")
+ns.db.settings.steerFollowUps = true
 check(ns.Transcript.echo[ns.viewId] ~= nil, "local echo shown")
 
 -- Pages
@@ -91,12 +96,99 @@ check(true, "pages switch")
 -- New thread flow
 ns.Main:StartNewThread()
 check(ns.Main.mode == "new" and ns.Main.newProject ~= nil, "new thread mode with project " .. tostring(ns.Main.newProject))
+local hdr = ns.Main.frame.Pages.threads.Right.Header
+check(ns.Transport:Payload():find(ns.Store.modelsHash, 1, true) ~= nil and ns.Store.modelsHash ~= "", "hello reports the model list it has: " .. ns.Store.modelsHash)
+local function Choices(dd)
+	local list = {}
+	for _, o in ipairs(dd.options) do if not o.header then table.insert(list, o) end end
+	return list
+end
+local groups = {}
+for _, o in ipairs(hdr.Model.options) do if o.header then table.insert(groups, o.label) end end
+check(hdr.Model:IsShown() and #Choices(hdr.Model) >= 1, "model picker shown for a new thread: " .. #Choices(hdr.Model) .. " models")
+check(hdr.Model.options[1].header and #groups >= 2, "models grouped under headers: " .. table.concat(groups, ", "))
+check(hdr.Model.Text:GetText():find(" · ", 1, true) ~= nil, "the button names the provider: " .. hdr.Model.Text:GetText())
+do
+	-- A search for a provider keeps its header and its models; headers aren't choices.
+	local provider = groups[#groups]
+	ns.UI.OpenList(hdr.Model)
+	local l = ns.UI.ListOpen()
+	l.Search:SetText(provider:lower())
+	ns.UI.RefreshList()
+	local at, others
+	for n, o in ipairs(l.filtered) do
+		if o.header and o.label == provider then at = n end
+		-- Another provider's model may match on its own name ("GPT-5 Codex" under OpenCode, say).
+		if not o.header and o.group ~= provider and o.group ~= "Recent" and not o.label:lower():find(provider:lower(), 1, true) then others = true end
+	end
+	check(at and l.filtered[at + 1] and not l.filtered[at + 1].header and not others, "searching a provider's name lists its models under its header")
+	l:Hide()
+end
+do
+	local seq = ns.Transport.stripSeq
+	ns.Transport:Apply({ gen = data.gen + 1, threads = data.threads, projects = data.projects, bridge = data.bridge, usage = data.usage, models = { h = "00000000", g = {} } })
+	check(ns.Transport.stripSeq ~= seq and ns.Transport:Payload():find("00000000", 1, true) ~= nil, "a new model list is announced straight away")
+	check(ns.Store:ModelOptions("", nil) == nil, "an empty list clears the models")
+	check(not hdr.Model:IsShown() and not hdr.Effort:IsShown(), "no models: neither picker is left on screen")
+	data.gen = data.gen + 1
+	ns.Transport:Apply({ gen = data.gen + 1, threads = data.threads, projects = data.projects, bridge = data.bridge, usage = data.usage, models = data.models })
+	data.gen = data.gen + 1
+	check(hdr.Model:IsShown(), "the list comes back")
+end
+check(ns.Main:ChosenNewModel() == nil and ns.Main:NewThreadModel() ~= nil, "no pick yet: the picker shows T3's default but sends none")
+-- Pick the last model that has reasoning levels (any model when none has).
+local pick
+for _, o in ipairs(Choices(hdr.Model)) do
+	if not pick or ns.Store:EffortOptions("", o.value) then pick = o end
+end
+ns.Main:PickModel(pick.value)
+check(ns.db.models[ns.Main.newProject] == pick.value and ns.Main:NewThreadModel() == pick.value, "picked model remembered for the project: " .. pick.label)
+local level
+if hdr.Effort:IsShown() then
+	local levels, default = ns.Store:EffortOptions("", pick.value)
+	for _, o in ipairs(levels) do if o.value ~= default then level = o.value end end
+	local proj = ns.Store.projectsById[ns.Main.newProject]
+	local inherited = (proj.dm == pick.value and proj.de) or ns.Store:LastEffort("", pick.value) or default
+	check(ns.Main:ChosenNewEffort() == nil and hdr.Effort.value == inherited, "no level picked: the picker shows the level the thread would get: " .. inherited)
+	ns.Main:PickEffort(level)
+	check(ns.db.efforts[ns.Main.newProject] == level and hdr.Effort.value == level, "picked level remembered for the project: " .. level)
+else
+	check(false, "the reasoning picker shows for " .. pick.label)
+end
 ns.Main.composer._text = "Build a thing"
 ns.Main:Send()
 check(ns.Transport:Payload():find("\031new\031", 1, true) ~= nil, "new-thread command in payload")
+local pickI, pickS = ns.Store.SplitModelKey(pick.value)
+check(ns.Transport:Payload():find("Build a thing\031" .. pickI .. "\031" .. pickS .. (level and ("\031" .. level) or ""), 1, true) ~= nil, "picked model and level ride along with the new thread")
 ns.Transport:Apply({ gen = data.gen + 2, results = { { id = ns.Main.pendingNew, ok = true, open = firstThread.id } }, threads = data.threads, projects = data.projects, bridge = data.bridge, usage = data.usage, ack = { ui = ns.ui, seq = ns.Transport.stripSeq } })
 check(ns.Main.mode == "thread" and ns.viewId == firstThread.id, "result opened the new thread")
 check(#ns.Transport.queue == 0, "all commands acknowledged")
+check(hdr.Model:IsShown(), "model picker shown for an open thread")
+local cur = ns.Main:ThreadModel(ns.Store:Thread(ns.viewId))
+local other
+for _, o in ipairs(Choices(hdr.Model)) do if o.value ~= cur then other = o break end end
+if other then
+	ns.Main:PickModel(other.value)
+	local oi, os_ = ns.Store.SplitModelKey(other.value)
+	check(ns.Transport:Payload():find("\031model\031" .. ns.viewId .. "\031" .. oi .. "\031" .. os_, 1, true) ~= nil, "switching a thread's model sends model")
+	check(hdr.Model.value == other.value, "the picker shows the new model straight away")
+	ns.Transport:Apply({ gen = data.gen + 3, results = { { id = ns.Main.pendingModel.cmd, ok = false, msg = "Codex is switched off in T3 Code. Pick another model." } }, threads = data.threads, projects = data.projects, bridge = data.bridge, usage = data.usage, ack = { ui = ns.ui, seq = ns.Transport.stripSeq } })
+	check(ns.Main.pendingModel == nil and hdr.Model.value == cur, "a refused switch puts the picker back")
+end
+do
+	local t = ns.Store:Thread(ns.viewId)
+	local levels = ns.Store:EffortOptions(ns.Store.EnvOf(t.id), ns.Store.ModelKey(t.mi, t.m))
+	check(hdr.Effort:IsShown() == (levels ~= nil), "the reasoning picker shows when the thread's model has levels")
+	if levels then
+		local next
+		for _, o in ipairs(levels) do if o.value ~= hdr.Effort.value then next = o.value break end end
+		ns.Main:PickEffort(next)
+		check(ns.Transport:Payload():find("\031model\031" .. ns.viewId .. "\031" .. t.mi .. "\031" .. t.m .. "\031" .. next, 1, true) ~= nil, "changing a thread's level sends model with it")
+		check(hdr.Effort.value == next, "the picker shows the new level straight away")
+		ns.Transport:Apply({ gen = data.gen + 4, results = { { id = ns.Main.pendingEffort.cmd, ok = false, msg = "That level is gone." } }, threads = data.threads, projects = data.projects, bridge = data.bridge, usage = data.usage, ack = { ui = ns.ui, seq = ns.Transport.stripSeq } })
+		check(ns.Main.pendingEffort == nil and hdr.Effort.value ~= next, "a refused level puts the picker back")
+	end
+end
 
 -- Question / approval rendering
 data.gen = data.gen + 10
@@ -127,6 +219,38 @@ data.dict = { n = os.time() * 1000 + 5, state = "done", text = "pasted words" }
 ns.Transport:Apply(data)
 check(ns.Main.composer._text == "already pasted words", "text the backend already pasted isn't added again")
 ns.Main.composer._text = ""
+
+-- A desktop with no dictation backend (macOS today): the mic says why and sends nothing.
+data.bridge.dictation = nil
+data.bridge.dictationHint = "Dictation isn't available on macOS yet."
+data.gen = data.gen + 1
+ns.Transport:Apply(data)
+Stub.printed = {}
+local queued = #ns.Transport.queue
+ns.Main.dictating = false
+ns.Main.dictNoteAt = nil
+ns.Main:ToggleDictation()
+check(not ns.Main.dictating and #ns.Transport.queue == queued, "no dictation backend: nothing is sent")
+check(Stub.printed[1] and Stub.printed[1]:find("macOS", 1, true) ~= nil, "the mic explains why: " .. tostring(Stub.printed[1]))
+ns.Main:ToggleDictation()
+check(#Stub.printed == 1, "a repeated press doesn't repeat the note")
+ns.Main:Open()
+ns.Main:Refresh()
+check(not ns.Main.frame.Bar.Mic:IsEnabled(), "the mic is dimmed while there is no backend")
+data.bridge.dictation = "test backend"
+data.bridge.dictationHint = nil
+data.gen = data.gen + 1
+ns.Transport:Apply(data)
+ns.Main:Refresh()
+check(ns.Main.frame.Bar.Mic:IsEnabled(), "the mic is ready again once a backend is reported")
+
+-- A refused dictate command doesn't leave the mic stuck on.
+ns.Main.dictating = false
+ns.Main:ToggleDictation()
+check(ns.Main.dictating, "dictation starts when a backend is reported")
+data.gen = data.gen + 1
+ns.Transport:Apply({ gen = data.gen, results = { { id = ns.Main.dictCmd, ok = false, msg = "no microphone" } }, threads = data.threads, projects = data.projects, bridge = data.bridge, usage = data.usage, ack = { ui = ns.ui, seq = ns.Transport.stripSeq } })
+check(not ns.Main.dictating, "a refused dictate command puts the mic back")
 
 -- Plan, approval details, run summary, queued note
 data.gen = data.gen + 1
@@ -248,6 +372,38 @@ check(f._scripts.OnGamePadStick(f, "Left", 0, -1) == false, "left stick consumed
 check(down(f, "PADFORWARD") == false and f._shown == false and not ns.Gamepad.capturing, "Start closes the window and gives the controller back")
 ns.Main:Open()
 check(ns.Gamepad.capturing, "reopened window takes the controller again")
+-- The model picker sits on the header row: D-pad to it, A opens its list, B closes it.
+do
+	local prevView = ns.viewId
+	ns.Main:StartNewThread()
+	ns.Gamepad:Highlight(hdr.Project)
+	down(f, "PADDRIGHT")
+	check(ns.Gamepad.selected == hdr.Model, "Right from the project goes to the model picker")
+	down(f, "PAD1")
+	local l = ns.UI.ListOpen()
+	check(l ~= nil and l.owner == hdr.Model, "A opens the model list")
+	local rows, onHeader = 0, false
+	for _, c in ipairs(ns.Gamepad:Candidates()) do
+		rows = rows + 1
+		if c.ed and c.ed.header then onHeader = true end
+	end
+	check(rows > 0 and not onHeader, "the D-pad skips group headers in the list: " .. rows .. " rows")
+	down(f, "PAD2")
+	check(ns.UI.ListOpen() == nil and f._shown, "B closes the model list, not the window")
+	if hdr.Effort:IsShown() then
+		down(f, "PADDRIGHT")
+		check(ns.Gamepad.selected == hdr.Effort, "Right from the model goes to the reasoning picker")
+		down(f, "PAD1")
+		local open = ns.UI.ListOpen()
+		check(open ~= nil and open.owner == hdr.Effort, "A opens the reasoning list")
+		down(f, "PAD2")
+		down(f, "PADDLEFT")
+		check(ns.Gamepad.selected == hdr.Model, "Left from the reasoning picker goes back to the model")
+	end
+	down(f, "PADDLEFT")
+	check(ns.Gamepad.selected == hdr.Project, "Left goes back to the project")
+	ns.Main:SelectThread(prevView)
+end
 check(down(f, "PADRSHOULDER") == false and ns.Main.page == "usage", "RB switched to usage")
 down(f, "PADLSHOULDER")
 check(ns.Main.page == "threads", "LB switched back")
