@@ -55,7 +55,18 @@ export class Voice {
     const dictation = this.canOmarchyDictate()
       ? `omarchy-dictation (${this.backendName() || 'no backend set'})`
       : this.canTranscribe() ? 'voxtype' : null;
-    return { tts: e ? (e.kind === 'custom' ? 'custom' : path.basename(e.cmd)) : null, dictation };
+    return {
+      tts: e ? (e.kind === 'custom' ? 'custom' : path.basename(e.cmd)) : null,
+      dictation,
+      // What to tell the player when there is nothing to dictate with; Omarchy's
+      // dictation setup only exists on Linux.
+      hint: dictation ? null : this.dictationHint(),
+    };
+  }
+
+  dictationHint(platform = process.platform) {
+    if (platform === 'darwin') return "Dictation isn't available on macOS yet.";
+    return 'No dictation backend found; pick one in Omarchy > Setup > Defaults > Dictation.';
   }
 
   hush() {

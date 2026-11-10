@@ -177,12 +177,27 @@ function M:CreateThreadsPage(page)
 	header.Archive:SetPoint("RIGHT", header.Action, "LEFT", -4, 0)
 	header.Archive:Hide()
 	UI.Tooltip(header.Archive, "Archive", "Hide this thread from the list (it stays in T3 Code's archive).")
-	header.Project = UI.Dropdown(header, 220, function(value)
+	header.Project = UI.Dropdown(header, 176, function(value)
 		M.newProject = value
+		M.newModel, M.newEffort = nil, nil
 		M:Refresh()
 	end)
 	header.Project:SetPoint("RIGHT", -6, 0)
 	header.Project:Hide()
+	-- The model: for the new thread, or the open thread's next runs. Only a deliberate
+	-- pick from the list changes it (no wheel or right-click stepping), because each
+	-- change on a thread is a command to T3.
+	local function ListOnly(dd)
+		dd:SetScript("OnClick", function(self) UI.OpenList(self) end)
+		dd:EnableMouseWheel(false)
+		dd:SetScript("OnMouseWheel", nil)
+		dd:Hide()
+		return dd
+	end
+	header.Model = ListOnly(UI.Dropdown(header, 176, function(value) M:PickModel(value) end))
+	header.Model.listWidth = 300 -- room for "Model · Provider" rows
+	-- How hard the model reasons, when it has levels to pick from.
+	header.Effort = ListOnly(UI.Dropdown(header, 92, function(value) M:PickEffort(value) end))
 	right.Header = header
 
 	local composer = UI.Inset(right)
@@ -244,9 +259,10 @@ function M:CreateButtonBar(f)
 	bar.Mic = UI.IconButton(f, "voicechat-icon-mic", 26, "Dictate", function() M:ToggleDictation() end)
 	bar.Mic:SetPoint("LEFT", bar.Stop, "RIGHT", 6, 0)
 	UI.Tooltip(bar.Mic, nil, function()
-		local d = ns.Store.data.bridge and ns.Store.data.bridge.dictation
-		return d and ("Click, speak, click again: your words are typed into the message box (" .. d .. " on your desktop). On a controller, hold Y.")
-			or "No dictation backend found on the desktop. On Omarchy, install one from the menu (Install > AI > Dictation). Dictation isn't available on macOS yet."
+		local b = ns.Store.data.bridge or {}
+		if b.dictationHint then return b.dictationHint end
+		if not b.dictation then return "No dictation backend found on the desktop." end
+		return "Click, speak, click again: your words are typed into the message box (" .. b.dictation .. " on your desktop). On a controller, hold Y."
 	end)
 
 	bar.Speak = UI.IconButton(f, "voicechat-icon-speaker", 26, "Read aloud", function()
@@ -377,6 +393,7 @@ function M:StartNewThread(projectId)
 	self:Create()
 	self:SaveDraft()
 	self.mode = "new"
+	self.newModel, self.newEffort = nil, nil
 	local filter = ns.db.settings.project
 	self.newProject = projectId or (filter ~= "all" and filter) or ns.db.settings.lastProject
 	if not ns.Store.projectsById[self.newProject or ""] then
@@ -426,13 +443,24 @@ function M:Send(textOverride)
 			return
 		end
 		ns.db.settings.lastProject = self.newProject
-		self.pendingNew = ns.Transport:Send("new", self.newProject, text)
+		local instanceId, slug = ns.Store.SplitModelKey(self:ChosenNewModel())
+		local effort = self:ChosenNewEffort()
+		if effort then
+			-- An empty model means T3 Code's default, at this level.
+			self.pendingNew = ns.Transport:Send("new", self.newProject, text, instanceId or "", slug or "", effort)
+		else
+			self.pendingNew = ns.Transport:Send("new", self.newProject, text, instanceId, slug)
+		end
 		self.pendingNewText = text
 		ns.db.drafts.__new = nil
 	elseif ns.viewId and not textOverride and ns.Transcript:CustomAnswer(text) then
 		ns.db.drafts[ns.viewId] = nil
 	elseif ns.viewId then
-		ns.Transport:Send("send", ns.viewId, text)
+		if ns.db.settings.steerFollowUps then
+			ns.Transport:Send("send", ns.viewId, text, "steer")
+		else
+			ns.Transport:Send("send", ns.viewId, text)
+		end
 		ns.Transcript:AddLocalEcho(ns.viewId, text)
 		ns.db.drafts[ns.viewId] = nil
 	else
@@ -524,10 +552,20 @@ function M:ToggleDictation()
 		self.dictating = false
 		ns.Transport:Send("dictate", "stop")
 	else
+		local b = ns.Store.data.bridge
+		if b and b.dictationHint then
+			-- Push-to-talk repeats while the key is held; say this once, not every time.
+			local now = GetTime()
+			if not self.dictNoteAt or now - self.dictNoteAt > 5 then
+				self.dictNoteAt = now
+				ns.Print(b.dictationHint)
+			end
+			return
+		end
 		self.dictating = true
 		self:Open()
 		self.composer:SetFocus()
-		ns.Transport:Send("dictate", "start")
+		self.dictCmd = ns.Transport:Send("dictate", "start")
 	end
 	self:Refresh()
 end
@@ -596,15 +634,30 @@ function M:Refresh()
 	local t = ns.Store:Thread(ns.viewId)
 	if self.mode == "new" then
 		f.Subtitle:SetText("New Thread")
-		header.Text:SetText(ns.Color("gold", "Start a new thread in"))
-		header.Text:ClearAllPoints()
-		header.Text:SetPoint("LEFT", 12, 0)
-		header.Text:SetPoint("RIGHT", header.Project, "LEFT", -8, 0)
-		header.Text:SetJustifyH("RIGHT")
+		header.Text:SetText(ns.Color("gold", "New thread in"))
 		header.Action:Hide()
 		header.Archive:Hide()
 		header.Project:Show()
 		self:SetupProjectDropdown()
+		local withModel = self:SetupModelDropdown()
+		local withEffort = withModel and self:SetupEffortDropdown()
+		if not withEffort then header.Effort:Hide() end
+		header.Model.tipBody = "The model the new thread starts on. It's remembered for this project."
+		header.Effort.tipBody = "How hard the model reasons on the new thread. It's remembered for this project."
+		header.Effort:ClearAllPoints()
+		header.Effort:SetPoint("RIGHT", -6, 0)
+		header.Model:ClearAllPoints()
+		header.Model:SetPoint("RIGHT", withEffort and header.Effort or header, withEffort and "LEFT" or "RIGHT", withEffort and -4 or -6, 0)
+		header.Project:ClearAllPoints()
+		if withModel then
+			header.Project:SetPoint("RIGHT", header.Model, "LEFT", -6, 0)
+		else
+			header.Project:SetPoint("RIGHT", -6, 0)
+		end
+		header.Text:ClearAllPoints()
+		header.Text:SetPoint("LEFT", 12, 0)
+		header.Text:SetPoint("RIGHT", header.Project, "LEFT", -8, 0)
+		header.Text:SetJustifyH("RIGHT")
 		self:SetPlaceholder("Describe what the agent should do  (Shift+Enter for a new line)")
 		right.Hint:SetText(self:ShotHint() or "")
 		f.Bar.Send:SetText("Start")
@@ -623,23 +676,187 @@ function M:Refresh()
 			header.Action:SetShown(true)
 			header.Action:SetText(t.s == "settled" and "Reopen" or "Settle")
 			header.Archive:SetShown(t.s == "settled")
-			header.Text:SetPoint("RIGHT", t.s == "settled" and -200 or -110, 0)
-			self:SetPlaceholder(t.s == "working" and "Queue a follow-up  (Shift+Enter for a new line)" or "Message the agent  (Shift+Enter for a new line)")
+			local withModel = self:SetupModelDropdown()
+			local withEffort = withModel and self:SetupEffortDropdown()
+			if not withEffort then header.Effort:Hide() end
+			header.Model.tipBody = "The model for this thread. A change applies from the next reply on."
+			header.Effort.tipBody = "How hard the model reasons on this thread. A change applies from the next reply on."
+			local anchor = t.s == "settled" and header.Archive or header.Action
+			header.Effort:ClearAllPoints()
+			header.Effort:SetPoint("RIGHT", anchor, "LEFT", -4, 0)
+			header.Model:ClearAllPoints()
+			header.Model:SetPoint("RIGHT", withEffort and header.Effort or anchor, "LEFT", -4, 0)
+			local pickers = (withModel and header.Model:GetWidth() + 4 or 0) + (withEffort and header.Effort:GetWidth() + 4 or 0)
+			header.Text:SetPoint("RIGHT", (t.s == "settled" and -200 or -110) - pickers, 0)
+			local busy = ns.db.settings.steerFollowUps and "Steer the agent" or "Queue a follow-up"
+			self:SetPlaceholder((t.s == "working" and busy or "Message the agent") .. "  (Shift+Enter for a new line)")
 		else
 			f.Subtitle:SetText(ns.Color("grey", "No thread selected"))
 			header.Text:SetText(ns.Color("grey", "Pick a thread on the left, or start a new one"))
 			header.Action:Hide()
 			header.Archive:Hide()
+			header.Model:Hide()
+			header.Effort:Hide()
 		end
 		right.Hint:SetText(self:ShotHint() or (ns.Gamepad and ns.Gamepad:IsActive() and ns.Gamepad:HintText()) or "")
 	end
 	f.Bar.Stop:SetEnabled(t ~= nil and t.s == "working" and self.mode ~= "new")
 	f.Bar.Stop.Icon:SetDesaturated(not f.Bar.Stop:IsEnabled())
+	local bridge = ns.Store.data.bridge
+	local canDictate = self.dictating or not (bridge and bridge.dictationHint)
+	f.Bar.Mic:SetEnabled(canDictate)
+	f.Bar.Mic.Icon:SetDesaturated(not canDictate)
 	f.Bar.Mic.Icon:SetVertexColor(self.dictating and 1 or 1, self.dictating and 0.3 or 1, self.dictating and 0.3 or 1)
 	f.Bar.Back:SetEnabled(self.mode == "new" or ns.viewId ~= nil or not f.Pages.threads.Left:IsShown())
 	self:UpdateCounter()
 	ns.ThreadList:Refresh()
 	ns.Transcript:Refresh()
+end
+
+---------------------------------------------------------------------------
+-- Model picker
+
+-- The model the player picked for the new thread, now or last time in this project.
+-- Nil means T3 Code picks when the thread starts.
+function M:ChosenNewModel()
+	if self.newModel then return self.newModel end
+	local saved = self.newProject and ns.db.models[self.newProject]
+	if ns.Store:Offers(ns.Store.EnvOf(self.newProject), saved) then return saved end
+end
+
+-- What the picker shows: the chosen model, else T3 Code's default for the project.
+function M:NewThreadModel()
+	local chosen = self:ChosenNewModel()
+	if chosen then return chosen end
+	local env = ns.Store.EnvOf(self.newProject)
+	local p = ns.Store.projectsById[self.newProject or ""]
+	if p and p.dm then return p.dm end
+	for _, o in ipairs(ns.Store:ModelOptions(env) or {}) do
+		if not o.header then return o.value end
+	end
+end
+
+-- The open thread's model, or the one just picked for it until T3 confirms it.
+function M:ThreadModel(t)
+	local current = ns.Store.ModelKey(t.mi, t.m)
+	local pending = self.pendingModel
+	if pending and pending.thread == t.id then
+		if pending.value == current or GetTime() - pending.at > 30 then
+			self.pendingModel = nil
+		else
+			return pending.value
+		end
+	end
+	return current
+end
+
+-- Fill the model dropdown for what's on screen. Returns whether it's shown.
+function M:SetupModelDropdown()
+	local dd = self.frame.Pages.threads.Right.Header.Model
+	local env, current
+	if self.mode == "new" then
+		env, current = ns.Store.EnvOf(self.newProject), self:NewThreadModel()
+	else
+		local t = ns.Store:Thread(ns.viewId)
+		if t then env, current = ns.Store.EnvOf(t.id), self:ThreadModel(t) end
+	end
+	local options = env and ns.Store:ModelOptions(env, current)
+	if not options or (self.mode ~= "new" and not current) then
+		dd:Hide()
+		return false
+	end
+	dd.value = current
+	dd:SetOptions(options)
+	-- Wide enough for "Model · Provider" where it fits, so the provider isn't cut off.
+	local textW = dd.Text:GetUnboundedStringWidth() or 0
+	dd:SetWidth(math.min(self.mode == "new" and 200 or 220, math.max(150, math.ceil(textW) + 40)))
+	dd:Show()
+	return true
+end
+
+-- The reasoning level picked for the new thread, now or last time in this project,
+-- when the model it starts on offers it. Nil means the model's own.
+function M:ChosenNewEffort()
+	local options = ns.Store:EffortOptions(ns.Store.EnvOf(self.newProject), self:NewThreadModel())
+	if ns.Store.HasOption(options, self.newEffort) then return self.newEffort end
+	local saved = self.newProject and ns.db.efforts[self.newProject]
+	if ns.Store.HasOption(options, saved) then return saved end
+end
+
+-- The open thread's reasoning level, or the one just picked for it until T3 confirms it.
+function M:ThreadEffort(t)
+	local pending = self.pendingEffort
+	if pending and pending.thread == t.id then
+		if pending.value == t.re or GetTime() - pending.at > 30 then
+			self.pendingEffort = nil
+		else
+			return pending.value
+		end
+	end
+	return t.re
+end
+
+-- Fill the reasoning dropdown for the model on screen. Returns whether it's shown.
+function M:SetupEffortDropdown()
+	local dd = self.frame.Pages.threads.Right.Header.Effort
+	local env, model, current
+	if self.mode == "new" then
+		env, model = ns.Store.EnvOf(self.newProject), self:NewThreadModel()
+		current = self:ChosenNewEffort()
+		local p = ns.Store.projectsById[self.newProject or ""]
+		if not current then
+			-- What the bridge would carry over: T3's own pick when it's this model,
+			-- else the level last used with the model.
+			if p and p.dm == model then current = p.de else current = ns.Store:LastEffort(env, model) end
+		end
+	else
+		local t = ns.Store:Thread(ns.viewId)
+		if t then
+			env, model, current = ns.Store.EnvOf(t.id), self:ThreadModel(t), self:ThreadEffort(t)
+			-- Just switched to another model: it brings the level last used with it.
+			if model ~= ns.Store.ModelKey(t.mi, t.m) and not (self.pendingEffort and self.pendingEffort.thread == t.id) then
+				current = ns.Store:LastEffort(env, model)
+			end
+		end
+	end
+	local options, default = ns.Store:EffortOptions(env, model)
+	if not options then
+		dd:Hide()
+		return false
+	end
+	-- A level the model doesn't have (after a model switch, say) shows as its default.
+	dd.value = ns.Store.HasOption(options, current) and current or default
+	dd:SetOptions(options)
+	dd:Show()
+	return true
+end
+
+function M:PickEffort(value)
+	if self.mode == "new" then
+		self.newEffort = value
+		if self.newProject then ns.db.efforts[self.newProject] = value end
+	else
+		local t = ns.Store:Thread(ns.viewId)
+		if not t or value == self:ThreadEffort(t) then return end
+		local instanceId, slug = ns.Store.SplitModelKey(self:ThreadModel(t))
+		if not instanceId then return end
+		self.pendingEffort = { thread = t.id, value = value, at = GetTime(), cmd = ns.Transport:Send("model", t.id, instanceId, slug, value) }
+	end
+	self:Refresh()
+end
+
+function M:PickModel(value)
+	if self.mode == "new" then
+		self.newModel = value
+		if self.newProject then ns.db.models[self.newProject] = value end
+	else
+		local t = ns.Store:Thread(ns.viewId)
+		if not t or value == self:ThreadModel(t) then return end
+		local instanceId, slug = ns.Store.SplitModelKey(value)
+		if not instanceId then return end
+		self.pendingModel = { thread = t.id, value = value, at = GetTime(), cmd = ns.Transport:Send("model", t.id, instanceId, slug) }
+	end
+	self:Refresh()
 end
 
 function M:SetupProjectDropdown()
@@ -669,6 +886,9 @@ function M:HandleDictation(d)
 	if d.n <= (ns.db.lastDictN or 0) then return end
 	ns.db.lastDictN = d.n
 	if time() - math.floor(d.n / 1000) > 90 then return end -- left over from before a /reload
+	-- A failed start (no backend, the bridge dropped it) must not leave the mic stuck
+	-- "on", or the next press sends stop instead of start.
+	if d.state ~= "listening" and d.state ~= "transcribing" then self.dictating = false end
 	self.dictState = d.state
 	if d.state == "done" and d.text and d.text ~= "" then
 		self:Create()
@@ -714,9 +934,22 @@ ns:On("LinkChanged", function()
 	end
 end)
 ns:On("CommandResult", function(r)
+	if r.ok == false and r.id == M.dictCmd then
+		-- The start was refused before the bridge sent a dictation state; put the
+		-- mic back so the next press starts instead of sending stop.
+		M.dictCmd = nil
+		M.dictating = false
+		if M.frame and M.frame:IsShown() then M:Refresh() end
+	end
 	if r.ok == false and r.msg then
 		ns.Print(ns.Color("red", r.msg))
 		if UIErrorsFrame then UIErrorsFrame:AddMessage("T3 Code: " .. r.msg, 1, 0.2, 0.2) end
+	end
+	if r.ok == false then
+		local refused
+		if M.pendingModel and r.id == M.pendingModel.cmd then M.pendingModel, refused = nil, true end
+		if M.pendingEffort and r.id == M.pendingEffort.cmd then M.pendingEffort, refused = nil, true end
+		if refused and M.frame and M.frame:IsShown() then M:Refresh() end
 	end
 	if r.id == M.pendingNew then
 		M.pendingNew = nil

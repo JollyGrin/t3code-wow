@@ -87,7 +87,10 @@ local function CreateRow(button)
 		GameTooltip:AddLine(ns.Store:ProjectName(t.p), 0.7, 0.7, 0.7)
 		GameTooltip:AddLine(t.l or ns.Store.StatusText(t.s), 1, 1, 1, true)
 		if t.br then GameTooltip:AddLine("Branch: " .. t.br, 0.6, 0.8, 1) end
-		if t.m then GameTooltip:AddLine(t.m, 0.6, 0.6, 0.6) end
+		if t.m then
+			local label = t.mi and ns.Store:ModelLabel(ns.Store.EnvOf(t.id), ns.Store.ModelKey(t.mi, t.m)) or t.m
+			GameTooltip:AddLine(label, 0.6, 0.6, 0.6)
+		end
 		if t.last then
 			GameTooltip:AddLine(" ")
 			GameTooltip:AddLine(t.last, 0.9, 0.9, 0.9, true)

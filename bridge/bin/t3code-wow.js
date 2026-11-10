@@ -89,7 +89,7 @@ function resolveWowDir(args, cfg) {
     throw new Error(`found Battle.net (${prefixes[0]}) but no World of Warcraft. Install WoW: Forever from Battle.net, launch it once, then run ./install.sh again.${where}`);
   }
   if (MAC) throw new Error(`couldn't find World of Warcraft. Install Battle.net from blizzard.com, install WoW: Forever from it and launch it once, then run ./install.sh again.${where}`);
-  throw new Error(`couldn't find Battle.net. On Omarchy, install it with omarchy-install-gaming-battlenet, install WoW: Forever from it and launch it once, then run ./install.sh again.${where}`);
+  throw new Error(`couldn't find Battle.net. On Omarchy, install it with omarchy-install-gaming-battlenet; on CachyOS, add Battle.net to Faugus Launcher or Lutris. Then install WoW: Forever from it, launch it once, and run ./install.sh again.${where}`);
 }
 
 // The bridge runs as a systemd user service on Linux and a launchd agent on macOS.
@@ -259,6 +259,7 @@ async function cmdInstall(args) {
     }
     if (helper === 'built') console.log(`${C.g('✓')} ${MAC_HELPER_NAME} installed ${C.d(`(${macHelperPath()}; it holds the Screen Recording permission, so node doesn't need it)`)}`);
     else if (helper === 'rebuilt') console.log(`${C.g('✓')} ${MAC_HELPER_NAME} updated ${C.d('(it changed, so macOS asks for Screen Recording permission again)')}`);
+    else if (helper === 'repaired') console.log(`${C.y('!')} ${MAC_HELPER_NAME} had been changed since it was installed; restored it ${C.d('(if something else on this Mac changed it, check what that was)')}`);
     else console.log(`${C.g('✓')} ${MAC_HELPER_NAME} is up to date ${C.d('(its Screen Recording permission is kept)')}`);
   }
 
@@ -401,6 +402,7 @@ function cmdStatus(args) {
   }
   console.log(`  Live updates left this session: ${st.slots.remaining}/${st.slots.total} ${C.d(`· ${st.publishes} updates sent · update bell #${st.signals.next}`)}`);
   console.log(`  Speech: ${st.voice.tts || C.y('none')} · Dictation: ${st.voice.dictation || C.y('none')}`);
+  if (st.voice.hint) console.log(`    ${C.d(st.voice.hint)}`);
   if (args.log || args.v) {
     console.log('');
     for (const l of st.log) console.log(C.d(l));

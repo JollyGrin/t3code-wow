@@ -10,7 +10,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are reviewed, and [docs/
 
 ## Platforms
 
-Linux (Omarchy, the game under Proton) and macOS (the native client) are both supported. Keep platform differences inside the module that owns them: `wow.js` (install folders and the running client: Wine prefixes and `/proc` on Linux, Battle.net's records and `ps` on macOS), `capture.js` (`grim`/`import` on Linux; CoreGraphics' window list through JXA and `screencapture` on macOS, which needs the Screen Recording permission), `voice.js` (`spd-say`/`espeak-ng`, or `say`), `envs.js` (the Tailscale CLI inside `Tailscale.app` on macOS) and the service in `bin/t3code-wow.js` (a systemd user unit or a launchd agent). On macOS, use only tools that ship with the system: nothing to compile or install.
+Linux (Omarchy, and CachyOS with KDE Plasma, the game under Proton) and macOS (the native client) are supported. Keep platform differences inside the module that owns them: `wow.js` (install folders and the running client: Wine prefixes, including those Faugus Launcher and Lutris record, and `/proc` on Linux; Battle.net's records and `ps` on macOS), `capture.js` (`grim` on Hyprland, KWin's D-Bus API through `busctl` on KDE Plasma, `import` on X11; CoreGraphics' window list through JXA and `screencapture` on macOS, which needs the Screen Recording permission), `voice.js` (`spd-say`/`espeak-ng`, or `say`), `envs.js` (the Tailscale CLI inside `Tailscale.app` on macOS) and the service in `bin/t3code-wow.js` (a systemd user unit or a launchd agent). On macOS, use only tools that ship with the system: nothing to compile or install. On KDE Plasma, likewise use only what Plasma and systemd ship.
 
 ## Measured limits of the game client
 

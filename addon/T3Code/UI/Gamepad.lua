@@ -61,7 +61,7 @@ function G:Candidates()
 	if open then
 		local box = open.Box
 		box:ForEachFrame(function(frame, ed)
-			if InsideBox(frame, box) then add(frame, box, ed) end
+			if not ed.header and InsideBox(frame, box) then add(frame, box, ed) end
 		end)
 		return list
 	end
@@ -79,6 +79,8 @@ function G:Candidates()
 		add(header.Action)
 		add(header.Archive)
 		add(header.Project)
+		add(header.Model)
+		add(header.Effort)
 		local tbox = ns.Transcript.scrollBox
 		tbox:ForEachFrame(function(frame, ed)
 			if ed.kind == "option" and InsideBox(frame, tbox) then add(frame, tbox, ed) end
@@ -312,7 +314,8 @@ function G:Zone(cur)
 	local w = cur.w
 	local right = main.frame.Pages.threads.Right
 	if w == ns.ThreadList.dropdown or cur.box == ns.ThreadList.scrollBox then return "list" end
-	if w == main.composer or w == right.Header.Action or w == right.Header.Archive or w == right.Header.Project or cur.box == ns.Transcript.scrollBox then
+	local h = right.Header
+	if w == main.composer or w == h.Action or w == h.Archive or w == h.Project or w == h.Model or w == h.Effort or cur.box == ns.Transcript.scrollBox then
 		return "convo"
 	end
 	for _, key in ipairs({ "Refresh", "New", "Back", "Stop", "Mic", "Speak", "Shot", "Send" }) do
@@ -333,17 +336,28 @@ function G:ExplicitMove(cur, dirKey)
 	end
 
 	if zone == "convo" then
-		if dirKey == "PADDLEFT" then
-			if cur.w == right.Header.Project then return false end
-			if cur.w == right.Header.Action and Usable(right.Header.Archive) then
-				self:Highlight(right.Header.Archive)
+		-- The header row, left to right: [Project] [Model] [Reasoning] on a new
+		-- thread, [Model] [Reasoning] [Archive] [Settle] on an open one.
+		local h = right.Header
+		local row = {}
+		for _, w in ipairs({ h.Project, h.Model, h.Effort, h.Archive, h.Action }) do
+			if Usable(w) then table.insert(row, w) end
+		end
+		local at
+		for n, w in ipairs(row) do if w == cur.w then at = n end end
+		if at and (dirKey == "PADDLEFT" or dirKey == "PADDRIGHT") then
+			local target = row[at + (dirKey == "PADDRIGHT" and 1 or -1)]
+			if target then
+				self:Highlight(target)
 				return true
 			end
+			if dirKey == "PADDRIGHT" then return false end
+			-- Past the left end: the thread list (on a new thread, let geometry decide).
+			if main.mode == "new" then return false end
 			return listShown and self:SelectOpenThreadRow() or false
 		end
-		if dirKey == "PADDRIGHT" and cur.w == right.Header.Archive then
-			self:Highlight(right.Header.Action)
-			return true
+		if dirKey == "PADDLEFT" then
+			return listShown and self:SelectOpenThreadRow() or false
 		end
 		if dirKey == "PADDUP" or dirKey == "PADDDOWN" then
 			-- The column, top to bottom.
@@ -359,6 +373,8 @@ function G:ExplicitMove(cur, dirKey)
 			for n, entry in ipairs(seq) do
 				if (entry.w and entry.w == cur.w) or (entry.index and entry.index == curIndex) then pos = n end
 			end
+			-- Anywhere on the header row counts as its top.
+			if not pos and at and top then pos = 1 end
 			if not pos then return false end
 			local nextPos = pos + (dirKey == "PADDDOWN" and 1 or -1)
 			if nextPos > #seq then
@@ -414,9 +430,12 @@ function G:Move(dirKey)
 		local size = box:GetDataProviderSize()
 		local step = d[2] > 0 and -1 or 1
 		local nextIndex = index and index + step
+		-- A dropdown's group headers aren't choices; the thread list's are.
+		local open = UI.ListOpen()
+		local headers = not (open and box == open.Box)
 		while nextIndex and nextIndex >= 1 and nextIndex <= size do
 			local ed = box:FindElementData(nextIndex)
-			if ed and (ed.thread or ed.header or ed.kind == "option" or ed.value ~= nil) then break end
+			if ed and (ed.thread or (ed.header and headers) or ed.kind == "option" or ed.value ~= nil) then break end
 			nextIndex = nextIndex + step
 		end
 		local frame = nextIndex and nextIndex >= 1 and nextIndex <= size and box:FindFrame(box:FindElementData(nextIndex))

@@ -250,7 +250,10 @@ function T:Apply(data, bootstrap)
 		if fresh then db.gen = data.gen end
 		self.lastData = GetTime()
 		self.bridgeNow = data.now
+		local hadModels = ns.Store.modelsHash
 		ns.Store:Apply(data)
+		-- Tell the bridge we have the new list, or it keeps sending it with every update.
+		if ns.Store.modelsHash ~= hadModels then self:Touch() end
 	end
 	ns:Fire("LinkChanged")
 	return fresh
@@ -317,6 +320,7 @@ function T:Payload()
 	local hello = Codec.Record({
 		"H", 1, db.session, ns.ui, self.slotCursor, db.sigNext or 1, db.gen or 0,
 		self:Flags(), link and ns.viewId or "", ns.version, self.slotCount,
+		ns.Store.modelsHash or "",
 	})
 	if not link then return hello end
 	local limit = Codec.MAX_PAYLOAD - Codec.SEAL_OVERHEAD

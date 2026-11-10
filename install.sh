@@ -31,7 +31,8 @@ if (( major < 22 )); then
   exit 1
 fi
 
-if [[ ${XDG_SESSION_TYPE:-} == "wayland" ]] && ! command -v grim >/dev/null 2>&1; then
+# KDE Plasma doesn't need grim: the bridge reads the game through KWin's D-Bus API.
+if [[ ${XDG_SESSION_TYPE:-} == "wayland" && :${XDG_CURRENT_DESKTOP:-}: != *:KDE:* ]] && ! command -v grim >/dev/null 2>&1; then
   echo "Note: install grim so the bridge can see the game (pacman -S grim)." >&2
 fi
 

@@ -33,6 +33,9 @@ end
 function UI.IconButton(parent, icon, size, tooltip, onClick)
 	local b = CreateFrame("Button", nil, parent)
 	b:SetSize(size or 28, size or 28)
+	-- A disabled icon still needs its tooltip to explain why; the client skips
+	-- motion scripts on disabled buttons unless asked to keep them.
+	b:SetMotionScriptsWhileDisabled(true)
 	local bg = b:CreateTexture(nil, "BACKGROUND")
 	bg:SetAtlas("common-button-square-gray-up")
 	if not bg:GetAtlas() then
@@ -91,21 +94,28 @@ function UI.Cycler(parent, width, onChange)
 		if value ~= nil then self.value = value end
 		self:Update()
 	end
+	-- Options are { value, label, text? }: `text` is what the button shows when it
+	-- differs from the list row. Rows with `header` set only title a group.
 	function b:Update()
-		local label
+		local label, first
 		for _, o in ipairs(self.options) do
-			if o.value == self.value then label = o.label end
+			if not o.header then
+				first = first or o
+				if o.value == self.value then label = o.text or o.label end
+			end
 		end
-		self.Text:SetText(label or (self.options[1] and self.options[1].label) or "")
+		self.Text:SetText(label or (first and (first.text or first.label)) or "")
 	end
 	function b:Step(delta)
-		local n = #self.options
+		local choices = {}
+		for _, o in ipairs(self.options) do if not o.header then table.insert(choices, o) end end
+		local n = #choices
 		if n == 0 then return end
 		local current = 0
-		for i, o in ipairs(self.options) do if o.value == self.value then current = i end end
+		for i, o in ipairs(choices) do if o.value == self.value then current = i end end
 		local nextIndex = ((current - 1 + delta) % n) + 1
 		if current == 0 then nextIndex = delta > 0 and 1 or n end
-		self.value = self.options[nextIndex].value
+		self.value = choices[nextIndex].value
 		self:Update()
 		PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
 		if onChange then onChange(self.value) end
@@ -113,7 +123,7 @@ function UI.Cycler(parent, width, onChange)
 	b:SetScript("OnClick", function(self, button) self:Step(button == "RightButton" and -1 or 1) end)
 	b:EnableMouseWheel(true)
 	b:SetScript("OnMouseWheel", function(self, delta) self:Step(delta > 0 and -1 or 1) end)
-	UI.Tooltip(b, function(self) return self.Text:GetText() end, "Click to choose. Scroll to step through.")
+	UI.Tooltip(b, function(self) return self.Text:GetText() end, function(self) return self.tipBody or "Click to choose. Scroll to step through." end)
 	return b
 end
 
@@ -151,8 +161,9 @@ local function EnsureList()
 	search:HookScript("OnTextChanged", function() UI.RefreshList() end)
 	search:HookScript("OnEscapePressed", function() list:Hide() end)
 	search:HookScript("OnEnterPressed", function()
-		local first = list.filtered and list.filtered[1]
-		if first then UI.PickFromList(first.value) end
+		for _, o in ipairs(list.filtered or {}) do
+			if not o.header then return UI.PickFromList(o.value) end
+		end
 	end)
 	list.Search = search
 
@@ -177,6 +188,18 @@ local function EnsureList()
 			row.Text:SetJustifyH("LEFT")
 			row.Text:SetWordWrap(false)
 		end
+		if ed.header then
+			-- A group title: gold, flush left, not a choice.
+			row.Check:Hide()
+			row.Text:SetPoint("LEFT", 6, 0)
+			row.Text:SetText(ed.label)
+			row.Text:SetTextColor(NORMAL_FONT_COLOR:GetRGB())
+			row:EnableMouse(false)
+			row:SetScript("OnClick", nil)
+			return
+		end
+		row:EnableMouse(true)
+		row.Text:SetPoint("LEFT", 22, 0)
 		local selected = list.owner and list.owner.value == ed.value
 		row.Check:SetShown(selected)
 		row.Text:SetText(ed.label)
@@ -208,16 +231,30 @@ function UI.RefreshList()
 	local owner = l.owner
 	if not owner then return end
 	local query = (l.Search:GetText() or ""):lower()
-	local filtered = {}
+	local filtered, choices = {}, 0
+	local header -- the group title waiting for its first matching row
+	local function matches(text) return text and text:lower():find(query, 1, true) end
 	for _, o in ipairs(owner.options) do
-		if query == "" or o.label:lower():find(query, 1, true) then table.insert(filtered, o) end
+		if o.header then
+			header = o
+		else
+			choices = choices + 1
+			-- A row matches on its own text or its group's (a provider's name, say).
+			if query == "" or matches(o.label) or matches(o.group) then
+				if header then
+					table.insert(filtered, header)
+					header = nil
+				end
+				table.insert(filtered, o)
+			end
+		end
 	end
 	l.filtered = filtered
-	local showSearch = #owner.options > 10
+	local showSearch = choices > 10
 	l.Search:SetShown(showSearch)
 	local top = showSearch and -34 or -8
 	local rows = math.min(MAX_ROWS, math.max(1, #filtered))
-	l:SetSize(math.max(owner:GetWidth(), 220), -top + rows * ROW_H + 10)
+	l:SetSize(math.max(owner:GetWidth(), owner.listWidth or 220), -top + rows * ROW_H + 10)
 	l.Box:ClearAllPoints()
 	l.Box:SetPoint("TOPLEFT", 6, top)
 	l.Box:SetPoint("BOTTOMRIGHT", #filtered > MAX_ROWS and -20 or -6, 8)
