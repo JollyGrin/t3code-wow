@@ -259,6 +259,7 @@ async function cmdInstall(args) {
     }
     if (helper === 'built') console.log(`${C.g('✓')} ${MAC_HELPER_NAME} installed ${C.d(`(${macHelperPath()}; it holds the Screen Recording permission, so node doesn't need it)`)}`);
     else if (helper === 'rebuilt') console.log(`${C.g('✓')} ${MAC_HELPER_NAME} updated ${C.d('(it changed, so macOS asks for Screen Recording permission again)')}`);
+    else if (helper === 'repaired') console.log(`${C.y('!')} ${MAC_HELPER_NAME} had been changed since it was installed; restored it ${C.d('(if something else on this Mac changed it, check what that was)')}`);
     else console.log(`${C.g('✓')} ${MAC_HELPER_NAME} is up to date ${C.d('(its Screen Recording permission is kept)')}`);
   }
 

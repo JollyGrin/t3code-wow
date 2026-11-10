@@ -118,8 +118,8 @@ async function hyprWindow(pid) {
 // it. macOS gives that permission per app, and granting it to `node` would cover every
 // Node program on the machine. The helper is a stay-open JXA applet built with
 // `osacompile` (it ships with the system, so there's nothing to compile or install).
-// It reads CoreGraphics' window list and runs `screencapture`, but only for windows
-// that belong to World of Warcraft.
+// It reads CoreGraphics' window list and runs `screencapture`, but only for windows of
+// a World of Warcraft process signed by Blizzard.
 //
 // The bridge talks to it through files in a private (0700) folder in its state dir:
 // it writes req-<id>.json, the helper answers with res-<id>.json and, for a capture,
@@ -130,24 +130,60 @@ async function hyprWindow(pid) {
 // The permission is tied to the app's code signature (ad-hoc, so its cdhash), which
 // changes whenever this script does. Installs only rebuild the app when the script
 // changed (MAC_HELPER_VERSION), and then macOS asks again.
+//
+// What this doesn't stop: the app lives in the user's ~/Applications, and an ad-hoc
+// signature's cdhash doesn't cover the compiled script, so a program running as the
+// same user can replace the script and keep the permission. The bridge checks the
+// signature before it starts or uses the helper and refuses a modified one, and
+// `t3code-wow install` restores it, but a program that starts the modified app itself
+// isn't stopped by that.
 
 export const MAC_HELPER_NAME = 'T3Code WoW Capture';
 export const MAC_HELPER_ID = 'com.t3code-wow.capture';
 const WOW_BUNDLE_ID = 'com.blizzard.worldofwarcraft';
+// Blizzard's Developer ID team. The helper only treats a process as the game when its
+// running code satisfies this requirement, so another app can't claim the bundle id.
+const WOW_REQUIREMENT = 'anchor apple generic and certificate leaf[subject.OU] = "G847MC6JZ5"';
 const OUTSIDE_GAME = "that area isn't the corner of a visible World of Warcraft window";
-// The strip corner may start up to this many points below the window's top.
-const MAC_SEARCH_Y = 40;
-// The largest corner the bridge grabs, in points (at scale 1; Retina needs less).
-const MAC_CORNER = { width: CELLS_PER_ROW * 4 + 32, height: MAX_ROWS * 4 + 32 + MAC_SEARCH_Y };
+// The strip corner the bridge grabs, in physical pixels, plus how far below the
+// window's top (in points) the strip may start.
+const MAC_STRIP = { width: CELLS_PER_ROW * 4 + 32, height: MAX_ROWS * 4 + 32, searchY: 40 };
+
+// These run inside the helper, which gets their source, and in the bridge and tests.
+
+// The backing scale of the screen a window's centre is on. Window bounds are in points
+// with the origin at the top-left of the main display; screens come from NSScreen,
+// whose origin is bottom-left.
+export function windowScale(screens, b) {
+  const primary = screens[0];
+  if (!primary) return 1;
+  const cx = b.X + b.Width / 2;
+  const cy = b.Y + b.Height / 2;
+  const on = screens.find((s) => {
+    const top = primary.height - (s.y + s.height);
+    return cx >= s.x && cx < s.x + s.width && cy >= top && cy < top + s.height;
+  });
+  return (on || primary).scale || 1;
+}
+
+// The corner the bridge grabs on a screen of this scale, in points.
+export function cornerSize(scale, strip) {
+  return { width: Math.ceil(strip.width / scale), height: Math.ceil(strip.height / scale) + strip.searchY };
+}
 
 // What the helper lets anyone who can write to its folder capture: the strip corner of
-// a visible game window (a screen area, so it stays small) or a whole game window by
-// id (its own pixels, so nothing covering it). Both run inside the helper, which
-// gets their source, and in tests.
-export function allowedCorner(windows, r, max) {
+// a visible game window (a screen area, so it's kept to the size the bridge needs and
+// inside the window) or a whole game window by id (its own pixels, so nothing
+// covering it).
+export function allowedCorner(info, r, strip) {
   if (!Array.isArray(r) || r.length !== 4 || !r.every((n) => typeof n === 'number' && isFinite(n))) return false;
-  if (r[2] <= 0 || r[3] <= 0 || r[2] > max.width || r[3] > max.height) return false;
-  return windows.some((w) => w.layer === 0 && w.onscreen && w.bounds.Width > 100 && w.bounds.Height > 100 && Math.abs(r[0] - w.bounds.X) <= 2 && Math.abs(r[1] - w.bounds.Y) <= 2);
+  if (r[2] <= 0 || r[3] <= 0) return false;
+  return info.windows.some((w) => {
+    const b = w.bounds;
+    if (w.layer !== 0 || !w.onscreen || b.Width <= 100 || b.Height <= 100) return false;
+    const max = cornerSize(windowScale(info.screens, b), strip);
+    return Math.abs(r[0] - b.X) <= 2 && Math.abs(r[1] - b.Y) <= 2 && r[2] <= max.width && r[3] <= max.height && r[0] + r[2] <= b.X + b.Width + 2 && r[1] + r[3] <= b.Y + b.Height + 2;
+  });
 }
 
 export function allowedWindow(windows, id) {
@@ -155,7 +191,7 @@ export function allowedWindow(windows, id) {
 }
 
 export const MAC_HELPER_JXA = `// ${MAC_HELPER_NAME}: lets the T3 Code bridge for World of Warcraft read the game window.
-// It only lists and captures windows that belong to World of Warcraft (${WOW_BUNDLE_ID}).
+// It only lists and captures windows of World of Warcraft (${WOW_BUNDLE_ID}, signed by Blizzard).
 ObjC.import('Foundation');
 ObjC.import('AppKit');
 ObjC.import('CoreGraphics');
@@ -163,16 +199,16 @@ ObjC.bindFunction('CGPreflightScreenCaptureAccess', ['bool', []]);
 ObjC.bindFunction('CGRequestScreenCaptureAccess', ['bool', []]);
 const fm = $.NSFileManager.defaultManager;
 const IDLE_QUIT_MS = 300000;
-const CORNER = ${JSON.stringify(MAC_CORNER)};
+const STRIP = ${JSON.stringify(MAC_STRIP)};
+const WOW_REQUIREMENT = ${JSON.stringify(WOW_REQUIREMENT)};
+${windowScale.toString()}
+${cornerSize.toString()}
 ${allowedCorner.toString()}
 ${allowedWindow.toString()}
+const me = $.NSProcessInfo.processInfo.processIdentifier;
+const signedGame = {};
 let dir = null;
 let last = Date.now();
-
-function quit() {
-  $.NSApplication.sharedApplication.terminate(null);
-  return 1;
-}
 
 function readText(p) {
   const s = $.NSString.stringWithContentsOfFileEncodingError(p, $.NSUTF8StringEncoding, null);
@@ -183,27 +219,56 @@ function writeText(name, text) {
   $(text).writeToFileAtomicallyEncodingError(dir + '/' + name, true, $.NSUTF8StringEncoding, null);
 }
 
+function quit() {
+  // Leave no pid behind for the bridge to mistake for a running helper.
+  try {
+    if (dir && JSON.parse(readText(dir + '/ready.json')).pid === me) fm.removeItemAtPathError(dir + '/ready.json', null);
+  } catch (e) {}
+  $.NSApplication.sharedApplication.terminate(null);
+  return 1;
+}
+
+function exec(launchPath, args) {
+  const task = $.NSTask.alloc.init;
+  task.launchPath = launchPath;
+  task.arguments = args;
+  const err = $.NSPipe.pipe;
+  task.standardError = err;
+  task.standardOutput = $.NSFileHandle.fileHandleWithNullDevice;
+  task.launch;
+  task.waitUntilExit;
+  const stderr = $.NSString.alloc.initWithDataEncoding(err.fileHandleForReading.readDataToEndOfFile, $.NSUTF8StringEncoding).js;
+  return { code: task.terminationStatus, stderr: stderr.trim() };
+}
+
 function run() {
   const args = ObjC.deepUnwrap($.NSProcessInfo.processInfo.arguments);
   dir = args.length > 1 ? args[args.length - 1] : '';
   if (dir[0] !== '/' || !fm.fileExistsAtPath(dir)) return quit();
-  writeText('ready.json', JSON.stringify({ pid: $.NSProcessInfo.processInfo.processIdentifier }));
+  writeText('ready.json', JSON.stringify({ pid: me }));
+}
+
+// Whether a process is World of Warcraft: its bundle id, and its running code signed
+// by Blizzard (checked once per process launch).
+function isGame(pid) {
+  const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(pid);
+  if (app.isNil() || app.bundleIdentifier.isNil() || app.bundleIdentifier.js !== '${WOW_BUNDLE_ID}') return false;
+  const key = pid + ':' + (app.launchDate.isNil() ? '' : app.launchDate.timeIntervalSince1970);
+  if (!(key in signedGame)) signedGame[key] = exec('/usr/bin/codesign', ['--verify', '-R=' + WOW_REQUIREMENT, String(pid)]).code === 0;
+  return signedGame[key];
 }
 
 // World of Warcraft's windows and the screens, in the shape pickMacWindow() takes.
 function gameWindows() {
   const arr = ObjC.castRefToObject($.CGWindowListCopyWindowInfo(16, 0));
-  const isGame = {};
+  const game = {};
   const windows = [];
   for (let i = 0; i < arr.count; i++) {
     const w = arr.objectAtIndex(i);
     const v = (k) => { const x = w.objectForKey(k); return x.isNil() ? null : x.js; };
     const pid = v('kCGWindowOwnerPID');
-    if (!(pid in isGame)) {
-      const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(pid);
-      isGame[pid] = !app.isNil() && !app.bundleIdentifier.isNil() && app.bundleIdentifier.js === '${WOW_BUNDLE_ID}';
-    }
-    if (!isGame[pid]) continue;
+    if (!(pid in game)) game[pid] = isGame(pid);
+    if (!game[pid]) continue;
     windows.push({ id: v('kCGWindowNumber'), pid: pid, layer: v('kCGWindowLayer'), onscreen: !!v('kCGWindowIsOnscreen'), bounds: ObjC.deepUnwrap(w.objectForKey('kCGWindowBounds')) });
   }
   const screens = $.NSScreen.screens.js.map((s) => ({ x: s.frame.origin.x, y: s.frame.origin.y, width: s.frame.size.width, height: s.frame.size.height, scale: s.backingScaleFactor }));
@@ -211,21 +276,13 @@ function gameWindows() {
 }
 
 function screencapture(args, file) {
-  const task = $.NSTask.alloc.init;
-  task.launchPath = '/usr/sbin/screencapture';
-  task.arguments = ['-x'].concat(args, [dir + '/' + file]);
-  const err = $.NSPipe.pipe;
-  task.standardError = err;
-  task.standardOutput = $.NSFileHandle.fileHandleWithNullDevice;
-  task.launch;
-  task.waitUntilExit;
-  const stderr = $.NSString.alloc.initWithDataEncoding(err.fileHandleForReading.readDataToEndOfFile, $.NSUTF8StringEncoding).js;
-  return task.terminationStatus === 0 ? { ok: true, file: file } : { ok: false, error: stderr.trim() || 'screencapture failed' };
+  const out = exec('/usr/sbin/screencapture', ['-x'].concat(args, [dir + '/' + file]));
+  return out.code === 0 ? { ok: true, file: file } : { ok: false, error: out.stderr || 'screencapture failed' };
 }
 
 // The strip corner (a rectangle in points) of a visible game window, as BMP.
 function captureCorner(req, id) {
-  if (!allowedCorner(gameWindows().windows, req.rect, CORNER)) return { ok: false, error: "${OUTSIDE_GAME}" };
+  if (!allowedCorner(gameWindows(), req.rect, STRIP)) return { ok: false, error: "${OUTSIDE_GAME}" };
   return screencapture(['-R', req.rect.map(Math.round).join(','), '-t', 'bmp'], 'cap-' + id + '.bmp');
 }
 
@@ -271,19 +328,31 @@ export function macHelperPath(home = os.homedir()) {
   return path.join(home, 'Applications', `${MAC_HELPER_NAME}.app`);
 }
 
+const helperExecutable = (app) => path.join(app, 'Contents/MacOS/applet');
+
+// Whether the app is still exactly as it was built: `codesign --verify --strict` checks
+// the sealed resources (the compiled script) too, which macOS doesn't check at launch.
+export function macHelperIntact(app = macHelperPath()) {
+  return spawnSync('codesign', ['--verify', '--strict', app]).status === 0;
+}
+
 // The helper version an installed app was built from, read from its Info.plist text.
 export function plistHelperVersion(text) {
   return /<key>T3CodeWowHelperVersion<\/key>\s*<string>([^<]*)<\/string>/.exec(text || '')?.[1] || null;
 }
 
-// Rebuild only when the script changed: a rebuild changes the signature, and macOS
-// then asks for Screen Recording again.
-export function macHelperNeedsBuild(app = macHelperPath()) {
+// Why the helper needs building: 'missing', 'old' (its script changed: a rebuild changes
+// the signature, and macOS asks for Screen Recording again), 'modified' (changed since
+// it was built: rebuilding restores the same signature, so the permission stays) or
+// null when it's current.
+export function macHelperNeedsBuild(app = macHelperPath(), { intact = macHelperIntact } = {}) {
   let text = null;
   try {
-    if (fs.existsSync(path.join(app, 'Contents/MacOS/applet'))) text = fs.readFileSync(path.join(app, 'Contents/Info.plist'), 'utf8');
+    if (fs.existsSync(helperExecutable(app))) text = fs.readFileSync(path.join(app, 'Contents/Info.plist'), 'utf8');
   } catch {}
-  return plistHelperVersion(text) !== MAC_HELPER_VERSION;
+  if (text === null) return 'missing';
+  if (plistHelperVersion(text) !== MAC_HELPER_VERSION) return 'old';
+  return intact(app) ? null : 'modified';
 }
 
 function sh(cmd, args) {
@@ -291,23 +360,44 @@ function sh(cmd, args) {
   if (r.status !== 0) throw new Error(`${cmd} failed: ${(r.stderr || r.stdout || '').trim() || `exit ${r.status}`}`);
 }
 
-// Quits a running helper: `pkill` matches its executable's full path.
-function quitMacHelper(app) {
-  spawnSync('pkill', ['-f', path.join(app, 'Contents/MacOS/applet')]);
+// The command line of a running process, or null.
+function commandOf(pid) {
+  const r = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' });
+  return r.status === 0 ? r.stdout.trim() : null;
 }
 
-// Builds the helper app if it's missing or out of date. Returns 'built' (new),
-// 'rebuilt' (changed, so macOS asks again) or 'current'.
+// Whether a command line is the helper's executable (not just mentions its path).
+export function isHelperCommand(command, app) {
+  const exe = helperExecutable(app);
+  return command === exe || (command || '').startsWith(`${exe} `);
+}
+
+// Quits every running copy of the helper.
+function quitMacHelper(app) {
+  const r = spawnSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' });
+  for (const line of (r.stdout || '').split('\n')) {
+    const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (m && isHelperCommand(m[2], app)) {
+      try {
+        process.kill(Number(m[1]));
+      } catch {}
+    }
+  }
+}
+
+// Builds the helper app if it's missing, out of date or modified. Returns 'built' (new),
+// 'rebuilt' (changed, so macOS asks again), 'repaired' (restored as built, permission
+// kept) or 'current'.
 export function installMacHelper(app = macHelperPath()) {
-  if (!macHelperNeedsBuild(app)) return 'current';
-  const existed = fs.existsSync(app);
+  const why = macHelperNeedsBuild(app);
+  if (!why) return 'current';
   quitMacHelper(app);
-  if (existed) {
+  if (why === 'old') {
     // The old grant no longer matches the new signature; clear it so Settings doesn't
     // show a switch that's on but doesn't work. tccutil needs the app to still exist.
     spawnSync('tccutil', ['reset', 'ScreenCapture', MAC_HELPER_ID]);
-    fs.rmSync(app, { recursive: true, force: true });
   }
+  fs.rmSync(app, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(app), { recursive: true });
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 't3code-wow-helper-'));
   try {
@@ -325,15 +415,18 @@ export function installMacHelper(app = macHelperPath()) {
     plist,
   ]);
   sh('codesign', ['--force', '-s', '-', '--identifier', MAC_HELPER_ID, app]);
-  return existed ? 'rebuilt' : 'built';
+  return { missing: 'built', old: 'rebuilt', modified: 'repaired' }[why];
 }
 
-// Quits the helper, clears its Screen Recording entry and deletes it. Returns whether
-// there was one.
+const LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister';
+
+// Quits the helper, clears its Screen Recording entry, forgets it in LaunchServices and
+// deletes it. Returns whether there was one.
 export function removeMacHelper(app = macHelperPath()) {
   if (!fs.existsSync(app)) return false;
   quitMacHelper(app);
   spawnSync('tccutil', ['reset', 'ScreenCapture', MAC_HELPER_ID]);
+  spawnSync(LSREGISTER, ['-u', app]);
   fs.rmSync(app, { recursive: true, force: true });
   return true;
 }
@@ -362,10 +455,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // The bridge's side of the file handoff.
 export class MacHelper {
-  constructor({ dir, app = macHelperPath(), launch = null } = {}) {
+  constructor({ dir, app = macHelperPath(), launch = null, intact = macHelperIntact, isHelper = null } = {}) {
     this.dir = dir;
     this.app = app;
-    this.launch = launch || ((app, dir) => spawnSync('open', ['-g', '-j', '-a', app, '--args', dir]).status === 0);
+    // -n: a copy someone else started (with another folder) can't take our place.
+    this.launch = launch || ((app, dir) => spawnSync('open', ['-n', '-g', '-j', '-a', app, '--args', dir]).status === 0);
+    this.intact = intact;
+    this.isHelper = isHelper || ((pid) => isHelperCommand(commandOf(pid), this.app));
     this.pid = null;
     this.launchedAt = 0;
     this.seq = 0;
@@ -384,12 +480,13 @@ export class MacHelper {
     if (this.pid && isAlive(this.pid)) return;
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     fs.chmodSync(this.dir, 0o700);
+    if (!fs.existsSync(this.app)) throw new Error(MAC_HELPER_MISSING);
+    if (!this.intact(this.app)) throw new Error(MAC_HELPER_MODIFIED);
     const running = this.readyPid();
-    if (running && isAlive(running)) {
+    if (running && isAlive(running) && this.isHelper(running)) {
       this.pid = running;
       return;
     }
-    if (!fs.existsSync(this.app)) throw new Error(MAC_HELPER_MISSING);
     // Clear what a previous helper left behind.
     for (const f of fs.readdirSync(this.dir)) if (/^(ready|req-|res-|cap-)/.test(f)) fs.rmSync(path.join(this.dir, f), { force: true });
     this.launchedAt = Date.now();
@@ -409,7 +506,7 @@ export class MacHelper {
   // Screen Recording grant only to a process started after it.
   restart() {
     if (Date.now() - this.launchedAt < 10000) return;
-    if (this.pid) {
+    if (this.pid && this.isHelper(this.pid)) {
       try {
         process.kill(this.pid);
       } catch {}
@@ -455,8 +552,7 @@ export class MacHelper {
 }
 
 // The game window from the helper's window list: its bounds and the scale of the
-// screen it's on. Window bounds are in points with the origin at the top-left of the
-// main display; screens come from NSScreen, whose origin is bottom-left.
+// screen it's on.
 export function pickMacWindow(info, pid) {
   const normal = info.windows.filter((w) => w.layer === 0 && w.bounds.Width > 100 && w.bounds.Height > 100);
   const mine = normal.filter((w) => w.pid === pid);
@@ -465,13 +561,7 @@ export function pickMacWindow(info, pid) {
   const win = pool.sort((a, b) => Number(b.onscreen) - Number(a.onscreen) || area(b) - area(a))[0];
   if (!win) return { found: false };
   const b = win.bounds;
-  const primary = info.screens[0];
-  // NSScreen frames are bottom-left based; flip them into window-list coordinates.
-  const screens = info.screens.map((s) => ({ ...s, y: primary.height - (s.y + s.height) }));
-  const cx = b.X + b.Width / 2;
-  const cy = b.Y + b.Height / 2;
-  const screen = screens.find((s) => cx >= s.x && cx < s.x + s.width && cy >= s.y && cy < s.y + s.height) || screens[0];
-  return { found: true, id: win.id, visible: win.onscreen, x: b.X, y: b.Y, width: b.Width, height: b.Height, scale: screen?.scale || 1 };
+  return { found: true, id: win.id, visible: win.onscreen, x: b.X, y: b.Y, width: b.Width, height: b.Height, scale: windowScale(info.screens, b) };
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +659,8 @@ export const SCREEN_PERMISSION_HELP =
   `macOS hasn't let ${MAC_HELPER_NAME} record the screen. Open System Settings > Privacy & Security > Screen & System Audio Recording and turn on ${MAC_HELPER_NAME} (if it isn't listed, add it with + from ${macHelperPath()}). The bridge notices within a few seconds.`;
 
 export const MAC_HELPER_MISSING = `${MAC_HELPER_NAME} isn't installed (${macHelperPath()}). Run \`t3code-wow install\` to add it.`;
+
+export const MAC_HELPER_MODIFIED = `${MAC_HELPER_NAME} has been changed since it was installed, so the bridge won't use it. Run \`t3code-wow install\` to restore it.`;
 
 // ---------------------------------------------------------------------------
 
@@ -683,36 +775,33 @@ export class StripCapture {
     if (backend === 'none') throw new Error('no capture backend: install grim (Wayland/wlroots) or ImageMagick (X11); on KDE Plasma the bridge uses busctl from systemd');
     const px = StripCapture.stripPixels(4);
     if (backend === 'macos') {
-      let region = this.manualRegion;
-      let scale = 1;
-      let searchY = 0;
-      if (!region) {
-        const win = await this.macWindow(wowPid);
-        if (!win.found) return { status: 'no-window' };
-        if (!win.visible) {
-          this.stats.notVisible++;
-          return { status: 'hidden' };
-        }
-        scale = win.scale;
-        region = { x: win.x, y: win.y };
-        // The strip can start below the window's top: under the title bar of a windowed
-        // game, or in fullscreen on a MacBook display, where the game moves its UI below
-        // the notch. Search 40 points down rather than guessing either height.
-        searchY = MAC_SEARCH_Y;
+      // The helper only captures the corner of the game window, so a manual region
+      // can't be used here.
+      if (this.manualRegion && !this.macRegionNoted) {
+        this.macRegionNoted = true;
+        this.log('capture.region is ignored on macOS: the bridge finds the game window itself');
       }
-      const w = Math.ceil(px.width / scale);
-      const h = Math.ceil(px.height / scale) + searchY;
+      const win = await this.macWindow(wowPid);
+      if (!win.found) return { status: 'no-window' };
+      if (!win.visible) {
+        this.stats.notVisible++;
+        return { status: 'hidden' };
+      }
+      // The strip can start below the window's top: under the title bar of a windowed
+      // game, or in fullscreen on a MacBook display, where the game moves its UI below
+      // the notch. Search 40 points down rather than guessing either height.
+      const size = cornerSize(win.scale, MAC_STRIP);
       let buf;
       try {
-        buf = await this.macCapture('corner', { rect: [region.x, region.y, w, h] });
+        buf = await this.macCapture('corner', { rect: [win.x, win.y, size.width, size.height] });
       } catch (err) {
         // The window moved or resized since it was looked up: look again, once.
-        if (err.message === OUTSIDE_GAME && !this.manualRegion && !retried) return this.grab(wowPid, true);
+        if (err.message === OUTSIDE_GAME && !retried) return this.grab(wowPid, true);
         throw err;
       }
       const image = parseBMP(buf);
       // screencapture works in physical pixels: scale the slack to match the image.
-      return { status: 'ok', image, searchY: Math.ceil(searchY * (image.width / w)) };
+      return { status: 'ok', image, searchY: Math.ceil(MAC_STRIP.searchY * (image.width / size.width)) };
     }
     if (backend === 'kwin') {
       let region = this.manualRegion;
@@ -784,6 +873,7 @@ export class StripCapture {
     }
     if (backend === 'macos') {
       const win = await this.macWindow(wowPid);
+      if (!win.found) throw new Error("the game window wasn't found");
       // The helper only captures a game window that's on screen (on this Space).
       if (!win.visible) throw new Error("the game window isn't on screen");
       let data = await this.macCapture('window', { id: win.id });

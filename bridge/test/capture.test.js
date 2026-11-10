@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { pickMacWindow, pickKwinWindow, allowedCorner, allowedWindow, MAC_HELPER_JXA, MacHelper, MAC_HELPER_VERSION, macHelperNeedsBuild, plistHelperVersion, parseHelperResponse } from '../src/capture.js';
+import { pickMacWindow, pickKwinWindow, allowedCorner, allowedWindow, cornerSize, windowScale, isHelperCommand, MAC_HELPER_JXA, MacHelper, MAC_HELPER_VERSION, macHelperNeedsBuild, plistHelperVersion, parseHelperResponse } from '../src/capture.js';
 
 const screens = [
   { x: 0, y: 0, width: 1512, height: 982, scale: 2 }, // built-in Retina, the primary
@@ -41,13 +41,24 @@ function fakeApp(dir, version) {
   return app;
 }
 
-test('the helper app is rebuilt only when missing, unversioned or from another script', () => {
+test('the helper app is rebuilt only when missing, from another script, or modified since it was built', () => {
   const dir = tmp();
-  assert.equal(macHelperNeedsBuild(path.join(dir, 'Missing.app')), true);
-  assert.equal(macHelperNeedsBuild(fakeApp(dir, MAC_HELPER_VERSION)), false);
-  assert.equal(macHelperNeedsBuild(fakeApp(dir, 'something-older')), true);
-  assert.equal(macHelperNeedsBuild(fakeApp(dir, null)), true);
+  const intact = () => true;
+  assert.equal(macHelperNeedsBuild(path.join(dir, 'Missing.app'), { intact }), 'missing');
+  assert.equal(macHelperNeedsBuild(fakeApp(dir, MAC_HELPER_VERSION), { intact }), null);
+  assert.equal(macHelperNeedsBuild(fakeApp(dir, 'something-older'), { intact }), 'old');
+  assert.equal(macHelperNeedsBuild(fakeApp(dir, null), { intact }), 'old');
+  assert.equal(macHelperNeedsBuild(fakeApp(dir, MAC_HELPER_VERSION), { intact: () => false }), 'modified');
   assert.equal(plistHelperVersion('<key>T3CodeWowHelperVersion</key>\n  <string>abc</string>'), 'abc');
+});
+
+test('only the helper executable itself counts as the running helper', () => {
+  const app = '/Users/x/Applications/T3Code WoW Capture.app';
+  assert.equal(isHelperCommand(`${app}/Contents/MacOS/applet /Users/x/.local/state/t3code-wow/capture`, app), true);
+  assert.equal(isHelperCommand(`${app}/Contents/MacOS/applet`, app), true);
+  assert.equal(isHelperCommand(`vim ${app}/Contents/MacOS/applet`, app), false);
+  assert.equal(isHelperCommand(`${app}/Contents/MacOS/applet-other`, app), false);
+  assert.equal(isHelperCommand(null, app), false);
 });
 
 test('helper answers that are not well-formed become errors', () => {
@@ -78,12 +89,13 @@ test('the bridge starts the helper once, in a private folder, and trades files w
   const helper = new MacHelper({
     dir,
     app,
+    intact: () => true,
     launch: (a, d) => {
       launches++;
       assert.deepEqual([a, d], [app, dir]);
       fs.writeFileSync(path.join(d, 'ready.json'), JSON.stringify({ pid: process.pid }));
       stop = fakeHelper(d, (req, id) => {
-        if (req.op !== 'capture') return { ok: true, access: true, info: { windows: [], screens: [] } };
+        if (req.op !== 'corner') return { ok: true, access: true, info: { windows: [], screens: [] } };
         fs.writeFileSync(path.join(d, `cap-${id}.bmp`), 'pixels');
         return { ok: true, access: true, file: `cap-${id}.bmp` };
       });
@@ -93,7 +105,8 @@ test('the bridge starts the helper once, in a private folder, and trades files w
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'res-stale.json'), '{}'); // left by an earlier helper
-    const [a, b] = await Promise.all([helper.request('windows', { pid: 5 }), helper.request('capture', { rect: [0, 0, 10, 10], type: 'bmp' })]);
+    fs.writeFileSync(path.join(dir, 'ready.json'), JSON.stringify({ pid: process.pid })); // a live pid that isn't the helper
+    const [a, b] = await Promise.all([helper.request('windows', { pid: 5 }), helper.request('corner', { rect: [0, 0, 10, 10] })]);
     assert.deepEqual(a.info, { windows: [], screens: [] });
     assert.equal(helper.take(b.file).toString(), 'pixels');
     assert.equal(launches, 1);
@@ -104,12 +117,17 @@ test('the bridge starts the helper once, in a private folder, and trades files w
   }
 });
 
-test('a helper that never starts, or is not installed, is reported', async () => {
+test('a helper that never starts, is not installed, or was modified is reported', async () => {
   const state = tmp();
   const dir = path.join(state, 'capture');
-  await assert.rejects(new MacHelper({ dir, app: path.join(state, 'Missing.app'), launch: () => true }).request('windows'), /isn't installed/);
+  const intact = () => true;
+  await assert.rejects(new MacHelper({ dir, app: path.join(state, 'Missing.app'), launch: () => true, intact }).request('windows'), /isn't installed/);
   const app = fakeApp(state, MAC_HELPER_VERSION);
-  await assert.rejects(new MacHelper({ dir, app, launch: () => false }).request('windows'), /couldn't start/);
+  await assert.rejects(new MacHelper({ dir, app, launch: () => false, intact }).request('windows'), /couldn't start/);
+  let launched = false;
+  const modified = new MacHelper({ dir, app, intact: () => false, launch: () => (launched = true) });
+  await assert.rejects(modified.request('windows'), /has been changed since it was installed/);
+  assert.equal(launched, false);
 });
 
 test('a helper that quits mid-request is noticed without waiting out the timeout', async () => {
@@ -125,20 +143,28 @@ test('a helper that quits mid-request is noticed without waiting out the timeout
 });
 
 test('the helper captures only the strip corner of a visible game window, or a visible game window by id', () => {
-  const game = { ...win(5, -1776, -260, 1776, 1050), id: 42 };
+  const strip = { width: 672, height: 192, searchY: 40 };
+  const retina = { ...win(5, 0, 0, 1512, 982), id: 42 }; // on the built-in Retina screen (scale 2)
+  const external = { ...win(5, 1600, -300, 1280, 748), id: 44 }; // on the external screen (scale 1)
   const elsewhere = { ...win(5, 0, 0, 1512, 982, { onscreen: false }), id: 43 }; // on another Space
-  const max = { width: 672, height: 232 };
-  assert.equal(allowedCorner([game], [-1776, -260, 336, 136], max), true);
-  assert.equal(allowedCorner([game], [-1776, -260, 1776, 1050], max), false); // the whole window, including what covers it
-  assert.equal(allowedCorner([game], [0, 0, 336, 136], max), false); // another place on screen
-  assert.equal(allowedCorner([elsewhere], [0, 0, 336, 136], max), false);
-  for (const bad of [null, [1, 2, 3], ['-1776', -260, 1, 1], [-1776, -260, Infinity, 1], [-1776, -260, -5, 10]]) assert.equal(allowedCorner([game], bad, max), false);
-  assert.equal(allowedWindow([game, elsewhere], 42), true);
-  assert.equal(allowedWindow([game, elsewhere], 43), false);
-  assert.equal(allowedWindow([game], 7), false);
-  assert.equal(pickMacWindow({ windows: [game], screens }, 5).id, 42);
+  const small = { ...win(5, 100, 100, 200, 150), id: 45 }; // smaller than the corner at scale 2
+  const ok = (w, r) => allowedCorner({ windows: [w], screens }, r, strip);
+  assert.deepEqual(cornerSize(2, strip), { width: 336, height: 136 });
+  assert.equal(windowScale(screens, external.bounds), 1);
+  assert.equal(ok(retina, [0, 0, 336, 136]), true);
+  assert.equal(ok(retina, [0, 0, 672, 232]), false); // the scale-1 size on a Retina screen
+  assert.equal(ok(external, [1600, -300, 672, 232]), true);
+  assert.equal(ok(retina, [0, 0, 1512, 982]), false); // the whole window, including what covers it
+  assert.equal(ok(retina, [500, 500, 336, 136]), false); // another place in the window
+  assert.equal(ok(elsewhere, [0, 0, 336, 136]), false);
+  assert.equal(ok(small, [100, 100, 336, 136]), false); // would reach past the window
+  for (const bad of [null, [1, 2, 3], ['0', 0, 1, 1], [0, 0, Infinity, 1], [0, 0, -5, 10]]) assert.equal(ok(retina, bad), false);
+  assert.equal(allowedWindow([retina, elsewhere], 42), true);
+  assert.equal(allowedWindow([retina, elsewhere], 43), false);
+  assert.equal(allowedWindow([retina], 7), false);
+  assert.equal(pickMacWindow({ windows: [retina], screens }, 5).id, 42);
   // The helper runs these same rules.
-  assert.ok(MAC_HELPER_JXA.includes(allowedCorner.toString()) && MAC_HELPER_JXA.includes(allowedWindow.toString()));
+  for (const f of [windowScale, cornerSize, allowedCorner, allowedWindow]) assert.ok(MAC_HELPER_JXA.includes(f.toString()));
 });
 
 const kwin = (pid, caption, extra = {}) => ({ pid, caption, uuid: `{${pid}}`, x: 10, y: 20, width: 1280, height: 720, minimized: false, desktops: ['d1'], ...extra });
