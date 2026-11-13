@@ -249,12 +249,15 @@ function run() {
 }
 
 // Whether a process is World of Warcraft: its bundle id, and its running code signed
-// by Blizzard (checked once per process launch).
+// by Blizzard (checked once per process launch). --ignore-resources skips the bundle's
+// other files: since the 2026-11-10 patch the game ships an unsigned icudt78l.dat next
+// to its executable, which fails a full check. The executable must still meet the
+// Blizzard requirement.
 function isGame(pid) {
   const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(pid);
   if (app.isNil() || app.bundleIdentifier.isNil() || app.bundleIdentifier.js !== '${WOW_BUNDLE_ID}') return false;
   const key = pid + ':' + (app.launchDate.isNil() ? '' : app.launchDate.timeIntervalSince1970);
-  if (!(key in signedGame)) signedGame[key] = exec('/usr/bin/codesign', ['--verify', '-R=' + WOW_REQUIREMENT, String(pid)]).code === 0;
+  if (!(key in signedGame)) signedGame[key] = exec('/usr/bin/codesign', ['--verify', '--ignore-resources', '-R=' + WOW_REQUIREMENT, String(pid)]).code === 0;
   return signedGame[key];
 }
 
